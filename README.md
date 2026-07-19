@@ -1,4 +1,4 @@
-# PolyBuild Pro v2.0
+# PolyBuild Pro v2.2
 
 > **Universal App & Game EXE Builder** — Auto-detects 20+ programming languages and game engines, self-updates, and auto-manages dependencies.
 
@@ -42,7 +42,8 @@ No manual configuration required for most projects.
 | Feature | Description |
 |---------|-------------|
 | **🔍 Auto-Detection** | Scans project files and scores confidence for 20+ language/ecosystem types |
-| **🛠️ Auto-Installation** | Missing compiler? PolyBuild installs it via `pip`, `npm`, or Chocolatey |
+| **🛠️ Auto-Installation** | Missing compiler? PolyBuild installs it via `pip`, `npm`, Chocolatey/winget (Windows), Homebrew (macOS), or apt-get (Linux) |
+| **🌐 Web App Bundling** | Plain `index.html` sites and bundler-based apps (Vite/CRA/webpack) are auto-wrapped in a generated Electron shell and compiled to `.exe` |
 | **🔄 Self-Updating** | Checks for new versions on startup; one-flag self-patch (`--update`) |
 | **📦 Dependency Sync** | Updates `requirements.txt`, `Cargo.toml`, `package.json`, `go.mod`, etc. before building |
 | **🎮 Game Engines** | Native export support for Godot, LÖVE2D; detection for Unity, Unreal, GameMaker, Ren'Py |
@@ -59,7 +60,8 @@ No manual configuration required for most projects.
 | Language | Build Tool | One-File | Icon | Notes |
 |----------|-----------|----------|------|-------|
 | **Python** | PyInstaller / Nuitka | ✅ | ✅ | Auto-detects tkinter, PyGame, PyQt |
-| **Node.js** | `pkg` | ✅ | ❌ | Bundles Node runtime |
+| **Node.js (CLI script)** | `pkg` | ✅ | ❌ | Bundles Node runtime; needs a `.js`/`.ts` entry point |
+| **Web App (`index.html`)** | Auto-generated Electron wrapper → `electron-builder` | ✅ | ✅ | Runs `npm run build` first if a build script exists, then wraps the compiled site (or a plain static site) in a minimal Electron shell |
 | **Electron** | `electron-builder` | ✅ | ✅ | Portable or NSIS installer |
 | **C** | GCC / Clang / CMake | ⚠️ | ❌ | Static linking supported |
 | **C++** | CMake → Make / MSVC | ⚠️ | ❌ | vcpkg integration |
@@ -94,9 +96,15 @@ No manual configuration required for most projects.
 
 ### Prerequisites
 
-- **Windows 10/11** (primary target; some features work on Linux/macOS for cross-compilation)
+- **Windows 10/11** (primary target — output is always a Windows `.exe`, even when building from Linux/macOS via cross-compilation)
 - **Python 3.8+** (to run PolyBuild itself)
 - **Internet connection** (for auto-installation of missing tools)
+- A package manager PolyBuild can use to auto-install missing toolchains:
+  - Windows: **winget** or **Chocolatey** (PolyBuild will install Chocolatey itself if neither is present)
+  - macOS: **Homebrew**
+  - Linux: **apt-get** (Debian/Ubuntu-based distros)
+
+  On other platforms/distros, PolyBuild will tell you what to install manually and where to get it.
 
 ### Setup
 
@@ -107,7 +115,8 @@ No manual configuration required for most projects.
 
    # Or place it in a global tools folder
    mkdir C:\Tools
-   move polybuild.py C:\Tools   setx PATH "%PATH%;C:\Tools"
+   move polybuild.py C:\Tools
+   setx PATH "%PATH%;C:\Tools"
    ```
 
 2. (Optional) Create a shorthand alias:
@@ -201,7 +210,7 @@ When you run `polybuild.py --init`, the following `polybuild.json` is generated:
 
 ```json
 {
-  "version": "2.0.0",
+  "version": "2.2.0",
   "project_dir": ".",
   "name": "MyApp",
   "icon": "assets/icon.ico",
@@ -242,15 +251,24 @@ python polybuild.py --name OverrideName
 python polybuild.py --backend nuitka --onefile --icon app.ico
 ```
 
-### Node.js / Electron
+### Node.js / Electron / Web Apps
 
-**Best for:** Desktop apps, SPAs, cross-platform tools
+**Best for:** Desktop apps, SPAs, cross-platform tools, plain HTML/CSS/JS sites
 
-**Node.js** uses `pkg` to create a single executable.
-**Electron** uses `electron-builder` with portable or NSIS targets.
+PolyBuild picks one of three paths depending on what it finds:
+
+- **Node.js CLI script** (entry point is a `.js`/`.ts` file, e.g. `index.js`) → bundled into a single executable with `pkg`.
+- **Web app** (entry point is `index.html`, with or without a `package.json`) → if a `build` script exists in `package.json` (Vite/CRA/webpack/etc.), PolyBuild runs `npm run build` and picks up the compiled output from `dist/`, `build/`, `out/`, or `public/`. Either way, the resulting static site is staged inside an auto-generated, minimal Electron shell and packaged with `electron-builder`. This also works for plain static sites with no `package.json` at all.
+- **Electron app** (project already declares `electron` as a dependency) → built directly with `electron-builder`, using your existing `package.json` `build` config if present, or a sensible default otherwise.
 
 ```bash
-# Electron app
+# Node.js CLI script
+python polybuild.py --lang node
+
+# Plain index.html site or a Vite/CRA/webpack app
+python polybuild.py --name MySite --icon assets/icon.ico
+
+# Already-configured Electron app
 python polybuild.py --lang electron --onefile
 ```
 
@@ -425,12 +443,15 @@ python polybuild.py --update-deps
 
 PolyBuild attempts auto-installation via:
 - **pip** (Python packages like PyInstaller, Nuitka, meson)
-- **npm** (Node packages like `pkg`, `electron-builder`)
-- **Chocolatey** (System tools like CMake, Go, Rust, Godot)
+- **npm** (Node packages like `pkg`, `electron`, `electron-builder` — installed into the project directory, not globally, unless the tool needs to be global)
+- **winget / Chocolatey** on Windows (system tools like CMake, Go, Rust, Godot, ninja, Maven, Gradle, Kotlin, UPX); PolyBuild installs Chocolatey itself first if neither is present
+- **Homebrew** on macOS
+- **apt-get** on Linux (Debian/Ubuntu-based)
 
 If auto-install fails:
-1. Install Chocolatey: https://chocolatey.org/install
-2. Or install the tool manually and ensure it's on `PATH`
+1. On Windows, install Chocolatey: https://chocolatey.org/install
+2. On macOS, install Homebrew: https://brew.sh
+3. Or install the tool manually and ensure it's on `PATH` — PolyBuild will print the official download link for the specific tool it couldn't install
 
 ### PyInstaller builds are too large
 

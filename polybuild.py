@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-PolyBuild Pro v2.0 - Universal App & Game EXE Builder
-Auto-detects 20+ languages, self-updates, auto-manages dependencies
+PolyBuild Pro v2.2 - Universal App & Game EXE Builder
+Auto-detects 20+ languages, self-updates, auto-manages & installs dependencies
 """
 
 import os
@@ -16,17 +16,18 @@ import urllib.request
 import hashlib
 import tempfile
 import zipfile
+import platform
 from pathlib import Path
-from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Optional, Tuple, Callable
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Tuple
 from enum import Enum, auto
 from datetime import datetime
 
 
 # ==================== VERSION & UPDATE ====================
-VERSION = "2.0.0"
-UPDATE_URL = "https://raw.githubusercontent.com/polybuild/polybuild/main/polybuild.py"
-VERSION_CHECK_URL = "https://raw.githubusercontent.com/polybuild/polybuild/main/version.json"
+VERSION = "2.2.0"
+UPDATE_URL = os.environ.get("POLYBUILD_UPDATE_URL", "")
+VERSION_CHECK_URL = os.environ.get("POLYBUILD_VERSION_URL", "")
 
 
 class Colors:
@@ -69,11 +70,14 @@ def dim(msg):
 # ==================== SELF-UPDATE SYSTEM ====================
 
 class SelfUpdater:
-    """Handles checking for updates and self-patching."""
+    """Handles checking for updates and self-patching. Disabled if URLs not set."""
     
     @staticmethod
     def check_update(force: bool = False) -> bool:
-        """Check if newer version exists online. Returns True if updated."""
+        if not VERSION_CHECK_URL or not UPDATE_URL:
+            dim("Self-update disabled. Set POLYBUILD_UPDATE_URL env var to enable.")
+            return False
+        
         try:
             log("Checking for PolyBuild updates...")
             req = urllib.request.Request(
@@ -102,7 +106,6 @@ class SelfUpdater:
     
     @staticmethod
     def _version_compare(v1: str, v2: str) -> int:
-        """Compare two version strings. Returns >0 if v1 is newer."""
         def normalize(v):
             return [int(x) for x in re.sub(r'[^0-9.]', '', v).split('.')]
         n1, n2 = normalize(v1), normalize(v2)
@@ -110,7 +113,6 @@ class SelfUpdater:
     
     @staticmethod
     def _perform_update(info: dict) -> bool:
-        """Download and replace current script."""
         try:
             log("Downloading update...")
             req = urllib.request.Request(
@@ -120,17 +122,14 @@ class SelfUpdater:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 new_code = resp.read().decode('utf-8')
             
-            # Verify hash if provided
             if 'sha256' in info:
                 if hashlib.sha256(new_code.encode()).hexdigest() != info['sha256']:
                     error("Update verification failed (hash mismatch)")
             
-            # Backup current script
             script_path = os.path.abspath(sys.argv[0])
             backup_path = script_path + ".backup"
             shutil.copy2(script_path, backup_path)
             
-            # Write new version
             with open(script_path, 'w', encoding='utf-8') as f:
                 f.write(new_code)
             
@@ -141,90 +140,450 @@ class SelfUpdater:
             return False
 
 
+# ==================== BASE TOOL INSTALLER ====================
+
+class BaseToolInstaller:
+    """Installs base runtimes like Node.js, Python, Git, Chocolatey, winget packages."""
+    
+    def __init__(self):
+        self._winget_checked = False
+        self._winget_available = False
+        self._choco_checked = False
+        self._choco_available = False
+        self._apt_checked = False
+        self._apt_available = False
+        self._brew_checked = False
+        self._brew_available = False
+    
+    def _has_apt(self) -> bool:
+        if sys.platform.startswith("linux") and not self._apt_checked:
+            self._apt_available = shutil.which("apt-get") is not None
+            self._apt_checked = True
+        return self._apt_available
+    
+    def _has_brew(self) -> bool:
+        if sys.platform == "darwin" and not self._brew_checked:
+            self._brew_available = shutil.which("brew") is not None
+            self._brew_checked = True
+        return self._brew_available
+    
+    def install_via_apt(self, package: str) -> bool:
+        """Install using apt-get on Debian/Ubuntu-based Linux."""
+        if not self._has_apt():
+            return False
+        log(f"Installing {package} via apt-get...")
+        try:
+            sudo = [] if os.geteuid() == 0 else ["sudo"]
+            subprocess.run(sudo + ["apt-get", "update", "-qq"], capture_output=True, timeout=180)
+            result = subprocess.run(
+                sudo + ["apt-get", "install", "-y"] + package.split(),
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode == 0:
+                success(f"{package} installed via apt-get")
+                return True
+            warn(f"apt-get install output: {result.stderr}")
+            return False
+        except Exception as e:
+            warn(f"apt-get install failed: {e}")
+            return False
+    
+    def install_via_brew(self, package: str) -> bool:
+        """Install using Homebrew on macOS."""
+        if not self._has_brew():
+            return False
+        log(f"Installing {package} via Homebrew...")
+        try:
+            result = subprocess.run(
+                ["brew", "install"] + package.split(),
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode == 0:
+                success(f"{package} installed via Homebrew")
+                return True
+            warn(f"brew install output: {result.stderr}")
+            return False
+        except Exception as e:
+            warn(f"Homebrew install failed: {e}")
+            return False
+    
+    def install_via_pkgmgr(self, apt_pkg: str = None, brew_pkg: str = None, choco_pkg: str = None, winget_id: str = None) -> bool:
+        """Try the best available package manager for the current OS, in order."""
+        if sys.platform == "win32":
+            if winget_id and self.install_via_winget(winget_id):
+                return True
+            if choco_pkg and self.install_via_choco(choco_pkg):
+                return True
+        elif sys.platform == "darwin":
+            if brew_pkg and self.install_via_brew(brew_pkg):
+                return True
+        elif sys.platform.startswith("linux"):
+            if apt_pkg and self.install_via_apt(apt_pkg):
+                return True
+        return False
+    
+    def _has_winget(self) -> bool:
+        if not self._winget_checked:
+            try:
+                result = subprocess.run(["winget", "--version"], capture_output=True, timeout=5)
+                self._winget_available = result.returncode == 0
+            except:
+                self._winget_available = False
+            self._winget_checked = True
+        return self._winget_available
+    
+    def _has_choco(self) -> bool:
+        if not self._choco_checked:
+            try:
+                result = subprocess.run(["choco", "--version"], capture_output=True, timeout=5)
+                self._choco_available = result.returncode == 0
+            except:
+                self._choco_available = False
+            self._choco_checked = True
+        return self._choco_available
+    
+    def install_via_winget(self, package_id: str) -> bool:
+        """Install using Windows Package Manager (winget)."""
+        if not self._has_winget():
+            return False
+        log(f"Installing {package_id} via winget...")
+        try:
+            result = subprocess.run(
+                ["winget", "install", "--id", package_id, "-e", "--accept-source-agreements", "--accept-package-agreements"],
+                capture_output=True, text=True, timeout=300
+            )
+            success(f"{package_id} installed via winget")
+            return True
+        except Exception as e:
+            warn(f"winget install failed: {e}")
+            return False
+    
+    def install_via_choco(self, package: str) -> bool:
+        """Install using Chocolatey."""
+        if not self._has_choco():
+            if not self.install_chocolatey():
+                return False
+        log(f"Installing {package} via Chocolatey...")
+        try:
+            result = subprocess.run(
+                ["choco", "install", package, "-y", "--no-progress"],
+                capture_output=True, text=True, timeout=300
+            )
+            success(f"{package} installed via Chocolatey")
+            return True
+        except Exception as e:
+            warn(f"Chocolatey install failed: {e}")
+            return False
+    
+    def install_chocolatey(self) -> bool:
+        """Install Chocolatey package manager on Windows."""
+        if sys.platform != 'win32':
+            return False
+        log("Installing Chocolatey...")
+        try:
+            cmd = [
+                'powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                '-Command',
+                "Set-ExecutionPolicy Bypass -Scope Process -Force; "
+                "[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; "
+                "iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))"
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0:
+                success("Chocolatey installed")
+                os.environ["PATH"] = os.environ.get("PATH", "") + r";C:\ProgramData\chocolatey\bin"
+                self._choco_available = True
+                return True
+            else:
+                warn(f"Chocolatey install output: {result.stderr}")
+                return False
+        except Exception as e:
+            warn(f"Failed to install Chocolatey: {e}")
+            return False
+    
+    def install_nodejs(self) -> bool:
+        """Download and install Node.js LTS silently."""
+        if sys.platform == 'win32':
+            # Try winget first (cleanest)
+            if self.install_via_winget("OpenJS.NodeJS"):
+                self._refresh_node_paths()
+                return True
+            
+            # Fallback to direct MSI download
+            log("Downloading Node.js LTS installer...")
+            installer_url = "https://nodejs.org/dist/v20.11.1/node-v20.11.1-x64.msi"
+            installer_path = os.path.join(tempfile.gettempdir(), "node_installer.msi")
+            
+            try:
+                urllib.request.urlretrieve(installer_url, installer_path)
+                log("Running Node.js installer (silent)...")
+                result = subprocess.run(
+                    ["msiexec", "/i", installer_path, "/qn", "/norestart"],
+                    capture_output=True, text=True, timeout=180
+                )
+                if result.returncode == 0:
+                    success("Node.js installed successfully!")
+                    self._refresh_node_paths()
+                    return True
+                else:
+                    warn(f"Node.js installer exited with code {result.returncode}")
+            except Exception as e:
+                warn(f"Failed to install Node.js: {e}")
+        elif self.install_via_pkgmgr(apt_pkg="nodejs npm", brew_pkg="node"):
+            return True
+        
+        warn("Automatic Node.js install failed. Install manually from https://nodejs.org/")
+        return False
+    
+    def _refresh_node_paths(self):
+        """Refresh PATH to include newly installed Node.js and npm."""
+        for node_path in [r"C:\Program Files\nodejs", r"C:\Program Files (x86)\nodejs"]:
+            if os.path.exists(node_path) and node_path not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = node_path + os.pathsep + os.environ.get("PATH", "")
+        npm_global = os.path.expandvars(r"%APPDATA%\npm")
+        if os.path.exists(npm_global) and npm_global not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = npm_global + os.pathsep + os.environ.get("PATH", "")
+    
+    def install_python(self) -> bool:
+        warn("Python is required to run PolyBuild but was not found.")
+        print(f"\n{Colors.CYAN}Please install Python 3.8+ from: https://www.python.org/downloads/{Colors.END}")
+        print(f"{Colors.CYAN}Make sure to check 'Add Python to PATH' during installation.{Colors.END}\n")
+        return False
+    
+    def install_git(self) -> bool:
+        if self.install_via_pkgmgr(apt_pkg="git", brew_pkg="git", choco_pkg="git", winget_id="Git.Git"):
+            return True
+        warn("Please install Git from https://git-scm.com/downloads")
+        return False
+    
+    def install_go(self) -> bool:
+        if self.install_via_pkgmgr(apt_pkg="golang-go", brew_pkg="go", choco_pkg="golang", winget_id="GoLang.Go"):
+            return True
+        warn("Please install Go from https://go.dev/dl/")
+        return False
+    
+    def install_rust(self) -> bool:
+        if sys.platform == 'win32':
+            if self.install_via_winget("Rustlang.Rustup"):
+                return True
+            log("Downloading Rust installer...")
+            try:
+                installer_path = os.path.join(tempfile.gettempdir(), "rustup-init.exe")
+                urllib.request.urlretrieve("https://win.rustup.rs/x86_64", installer_path)
+                result = subprocess.run([installer_path, "-y"], capture_output=True, text=True, timeout=180)
+                if result.returncode == 0:
+                    success("Rust installed via rustup")
+                    cargo_home = os.path.expanduser("~\\.cargo\\bin")
+                    if cargo_home not in os.environ.get("PATH", ""):
+                        os.environ["PATH"] = cargo_home + os.pathsep + os.environ.get("PATH", "")
+                    return True
+            except Exception as e:
+                warn(f"Rust install failed: {e}")
+        else:
+            # Cross-platform: official rustup install script (Linux/macOS)
+            log("Installing Rust via rustup.sh...")
+            try:
+                script_path = os.path.join(tempfile.gettempdir(), "rustup-init.sh")
+                urllib.request.urlretrieve("https://sh.rustup.rs", script_path)
+                os.chmod(script_path, 0o755)
+                result = subprocess.run(
+                    ["sh", script_path, "-y", "--default-toolchain", "stable"],
+                    capture_output=True, text=True, timeout=300
+                )
+                if result.returncode == 0:
+                    success("Rust installed via rustup")
+                    cargo_home = os.path.expanduser("~/.cargo/bin")
+                    if cargo_home not in os.environ.get("PATH", ""):
+                        os.environ["PATH"] = cargo_home + os.pathsep + os.environ.get("PATH", "")
+                    return True
+                warn(f"rustup script exited with code {result.returncode}")
+            except Exception as e:
+                warn(f"Rust install failed: {e}")
+        warn("Please install Rust from https://rustup.rs/")
+        return False
+    
+    def install_dotnet(self) -> bool:
+        if self.install_via_pkgmgr(apt_pkg="dotnet-sdk-8.0", brew_pkg="dotnet-sdk",
+                                    choco_pkg="dotnet-sdk", winget_id="Microsoft.DotNet.SDK.8"):
+            return True
+        warn("Please install .NET SDK from https://dotnet.microsoft.com/download")
+        return False
+    
+    def install_java(self) -> bool:
+        if self.install_via_pkgmgr(apt_pkg="openjdk-21-jdk", brew_pkg="openjdk",
+                                    choco_pkg="openjdk", winget_id="EclipseAdoptium.Temurin.21.JDK"):
+            return True
+        warn("Please install JDK from https://adoptium.net/")
+        return False
+    
+    def install_cmake(self) -> bool:
+        if self.install_via_pkgmgr(apt_pkg="cmake", brew_pkg="cmake",
+                                    choco_pkg="cmake", winget_id="Kitware.CMake"):
+            return True
+        warn("Please install CMake from https://cmake.org/download/")
+        return False
+    
+    def install_mingw(self) -> bool:
+        if sys.platform.startswith('linux'):
+            # On Linux the "MinGW" role is just a native GCC toolchain
+            if self.install_via_apt("build-essential"):
+                return True
+        if self.install_via_pkgmgr(apt_pkg="build-essential", brew_pkg="gcc",
+                                    choco_pkg="mingw", winget_id="MSYS2.MSYS2"):
+            return True
+        warn("Please install MinGW-w64 from https://www.mingw-w64.org/downloads/")
+        return False
+    
+    def install_flutter(self) -> bool:
+        if self.install_via_pkgmgr(brew_pkg="--cask flutter", winget_id="Google.Flutter"):
+            return True
+        if sys.platform.startswith('linux'):
+            warn("Auto-install of Flutter on Linux isn't supported; use snap: 'sudo snap install flutter --classic'")
+        warn("Please install Flutter from https://docs.flutter.dev/get-started/install")
+        return False
+    
+    def install_godot(self) -> bool:
+        if self.install_via_pkgmgr(apt_pkg="godot3", brew_pkg="godot",
+                                    choco_pkg="godot", winget_id="GodotEngine.GodotEngine"):
+            return True
+        warn("Please install Godot from https://godotengine.org/download")
+        return False
+    
+    def install_love(self) -> bool:
+        if self.install_via_pkgmgr(apt_pkg="love", brew_pkg="love",
+                                    choco_pkg="love", winget_id="Love2D.Love2D"):
+            return True
+        warn("Please install LÖVE2D from https://love2d.org/")
+        return False
+    
+    def install_nim(self) -> bool:
+        if self.install_via_pkgmgr(apt_pkg="nim", brew_pkg="nim", choco_pkg="nim"):
+            return True
+        warn("Please install Nim from https://nim-lang.org/install.html")
+        return False
+    
+    def install_zig(self) -> bool:
+        if self.install_via_pkgmgr(brew_pkg="zig", choco_pkg="zig", winget_id="zig.zig"):
+            return True
+        if sys.platform.startswith('linux'):
+            warn("Auto-install of Zig on Linux isn't supported by apt; use snap: 'sudo snap install zig --classic --beta'")
+        warn("Please install Zig from https://ziglang.org/download/")
+        return False
+    
+    def install_crystal(self) -> bool:
+        if self.install_via_pkgmgr(apt_pkg="crystal", brew_pkg="crystal", choco_pkg="crystal"):
+            return True
+        warn("Please install Crystal from https://crystal-lang.org/install/")
+        return False
+    
+    def install_ruby(self) -> bool:
+        if self.install_via_pkgmgr(apt_pkg="ruby-full", brew_pkg="ruby",
+                                    choco_pkg="ruby", winget_id="RubyInstallerTeam.Ruby.3.2"):
+            return True
+        warn("Please install Ruby from https://rubyinstaller.org/")
+        return False
+
+
 # ==================== DEPENDENCY MANAGER ====================
 
 class DependencyManager:
     """Auto-detects, checks, installs and updates build dependencies."""
     
-    # Registry of known tools and install methods
     TOOLS = {
         # Python ecosystem
-        'python': {'check': ['python', '--version'], 'type': 'runtime'},
+        'python': {'check': ['python', '--version'], 'type': 'runtime', 'install_fn': 'python'},
         'pip': {'check': ['pip', '--version'], 'type': 'python_tool'},
         'pyinstaller': {'check': ['pyinstaller', '--version'], 'install': 'pip', 'pkg': 'pyinstaller', 'type': 'python_tool'},
         'nuitka': {'check': ['python', '-m', 'nuitka', '--version'], 'install': 'pip', 'pkg': 'nuitka', 'type': 'python_tool'},
-        'cx_freeze': {'check': ['python', '-m', 'cx_Freeze', '--version'], 'install': 'pip', 'pkg': 'cx_Freeze', 'type': 'python_tool'},
         
         # Node.js ecosystem
-        'node': {'check': ['node', '--version'], 'type': 'runtime'},
-        'npm': {'check': ['npm', '--version'], 'type': 'runtime'},
+        'node': {'check': ['node', '--version'], 'type': 'runtime', 'install_fn': 'nodejs'},
+        'npm': {'check': ['npm', '--version'], 'type': 'runtime'},  # bundled with node
         'pkg': {'check': ['pkg', '--version'], 'install': 'npm', 'pkg': 'pkg', 'global': True, 'type': 'node_tool'},
         'electron-builder': {'check': ['npx', 'electron-builder', '--version'], 'install': 'npm', 'pkg': 'electron-builder', 'global': False, 'type': 'node_tool'},
-        'nexe': {'check': ['npx', 'nexe', '--version'], 'install': 'npm', 'pkg': 'nexe', 'global': False, 'type': 'node_tool'},
+        'electron': {'check': ['npx', 'electron', '--version'], 'install': 'npm', 'pkg': 'electron', 'global': False, 'type': 'node_tool'},
         
         # C/C++
-        'gcc': {'check': ['gcc', '--version'], 'install': 'choco', 'pkg': 'mingw', 'type': 'compiler'},
-        'g++': {'check': ['g++', '--version'], 'install': 'choco', 'pkg': 'mingw', 'type': 'compiler'},
+        'gcc': {'check': ['gcc', '--version'], 'install_fn': 'mingw', 'type': 'compiler'},
+        'g++': {'check': ['g++', '--version'], 'install_fn': 'mingw', 'type': 'compiler'},
         'clang': {'check': ['clang', '--version'], 'type': 'compiler'},
-        'cmake': {'check': ['cmake', '--version'], 'install': 'choco', 'pkg': 'cmake', 'type': 'build_tool'},
+        'cmake': {'check': ['cmake', '--version'], 'install_fn': 'cmake', 'type': 'build_tool'},
         'meson': {'check': ['meson', '--version'], 'install': 'pip', 'pkg': 'meson', 'type': 'build_tool'},
-        'ninja': {'check': ['ninja', '--version'], 'install': 'choco', 'pkg': 'ninja', 'type': 'build_tool'},
+        'ninja': {'check': ['ninja', '--version'], 'install': 'pkgmgr', 'choco_pkg': 'ninja', 'apt_pkg': 'ninja-build', 'brew_pkg': 'ninja', 'type': 'build_tool'},
         'make': {'check': ['make', '--version'], 'type': 'build_tool'},
         
         # .NET / C#
-        'dotnet': {'check': ['dotnet', '--version'], 'install': 'choco', 'pkg': 'dotnet-sdk', 'type': 'sdk'},
+        'dotnet': {'check': ['dotnet', '--version'], 'install_fn': 'dotnet', 'type': 'sdk'},
         'msbuild': {'check': ['msbuild', '/version'], 'type': 'build_tool'},
         
         # Go
-        'go': {'check': ['go', 'version'], 'install': 'choco', 'pkg': 'golang', 'type': 'sdk'},
+        'go': {'check': ['go', 'version'], 'install_fn': 'go', 'type': 'sdk'},
         
         # Rust
-        'cargo': {'check': ['cargo', '--version'], 'install': 'script', 'script': 'https://win.rustup.rs/', 'type': 'sdk'},
+        'cargo': {'check': ['cargo', '--version'], 'install_fn': 'rust', 'type': 'sdk'},
         'rustc': {'check': ['rustc', '--version'], 'type': 'sdk'},
         
         # Java
-        'java': {'check': ['java', '--version'], 'install': 'choco', 'pkg': 'openjdk', 'type': 'runtime'},
+        'java': {'check': ['java', '--version'], 'install_fn': 'java', 'type': 'runtime'},
         'javac': {'check': ['javac', '--version'], 'type': 'compiler'},
-        'mvn': {'check': ['mvn', '--version'], 'install': 'choco', 'pkg': 'maven', 'type': 'build_tool'},
-        'gradle': {'check': ['gradle', '--version'], 'install': 'choco', 'pkg': 'gradle', 'type': 'build_tool'},
+        'jpackage': {'check': ['jpackage', '--version'], 'type': 'build_tool'},  # bundled with JDK 14+
+        'mvn': {'check': ['mvn', '--version'], 'install': 'pkgmgr', 'choco_pkg': 'maven', 'apt_pkg': 'maven', 'brew_pkg': 'maven', 'type': 'build_tool'},
+        'gradle': {'check': ['gradle', '--version'], 'install': 'pkgmgr', 'choco_pkg': 'gradle', 'apt_pkg': 'gradle', 'brew_pkg': 'gradle', 'type': 'build_tool'},
         
         # Flutter / Dart
-        'flutter': {'check': ['flutter', '--version'], 'install': 'manual', 'url': 'https://docs.flutter.dev/get-started/install/windows', 'type': 'sdk'},
+        'flutter': {'check': ['flutter', '--version'], 'install_fn': 'flutter', 'type': 'sdk'},
         'dart': {'check': ['dart', '--version'], 'type': 'sdk'},
         
         # Kotlin
-        'kotlinc': {'check': ['kotlinc', '-version'], 'install': 'choco', 'pkg': 'kotlin', 'type': 'compiler'},
+        'kotlinc': {'check': ['kotlinc', '-version'], 'install': 'pkgmgr', 'choco_pkg': 'kotlin', 'apt_pkg': 'kotlin', 'brew_pkg': 'kotlin', 'type': 'compiler'},
         
         # Nim
-        'nim': {'check': ['nim', '--version'], 'install': 'choco', 'pkg': 'nim', 'type': 'sdk'},
+        'nim': {'check': ['nim', '--version'], 'install_fn': 'nim', 'type': 'sdk'},
         
         # Zig
-        'zig': {'check': ['zig', 'version'], 'install': 'choco', 'pkg': 'zig', 'type': 'sdk'},
+        'zig': {'check': ['zig', 'version'], 'install_fn': 'zig', 'type': 'sdk'},
         
         # Lua
         'lua': {'check': ['lua', '-v'], 'type': 'runtime'},
-        'love': {'check': ['love', '--version'], 'install': 'choco', 'pkg': 'love', 'type': 'runtime'},
+        'love': {'check': ['love', '--version'], 'install_fn': 'love', 'type': 'runtime'},
+        
+        # Crystal
+        'crystal': {'check': ['crystal', '--version'], 'install_fn': 'crystal', 'type': 'sdk'},
         
         # Ruby
-        'ruby': {'check': ['ruby', '--version'], 'install': 'choco', 'pkg': 'ruby', 'type': 'runtime'},
+        'ruby': {'check': ['ruby', '--version'], 'install_fn': 'ruby', 'type': 'runtime'},
         
         # Game Engines
-        'godot': {'check': ['godot', '--version'], 'install': 'choco', 'pkg': 'godot', 'type': 'engine'},
-        'unity': {'check': ['cmd', '/c', 'echo', 'unity'], 'type': 'engine'},  # Special handling
+        'godot': {'check': ['godot', '--version'], 'install_fn': 'godot', 'type': 'engine'},
         
         # Misc
-        'upx': {'check': ['upx', '--version'], 'install': 'choco', 'pkg': 'upx', 'type': 'tool'},
-        'git': {'check': ['git', '--version'], 'type': 'tool'},
+        'upx': {'check': ['upx', '--version'], 'install': 'pkgmgr', 'choco_pkg': 'upx', 'apt_pkg': 'upx', 'brew_pkg': 'upx', 'type': 'tool'},
+        'git': {'check': ['git', '--version'], 'install_fn': 'git', 'type': 'tool'},
+    }
+    
+    # Tools that are bundled with other tools (if parent installs, these are satisfied)
+    BUNDLED_TOOLS = {
+        'npm': 'node',      # npm comes with Node.js
+        'npx': 'node',      # npx comes with Node.js
+        'javac': 'java',    # javac comes with JDK
+        'jpackage': 'java', # jpackage comes with JDK 14+
+        'rustc': 'cargo',   # rustc comes with rustup/cargo
     }
     
     def __init__(self):
         self.cache = {}
-        self.choco_available = None
+        self.base_installer = BaseToolInstaller()
     
     def is_installed(self, tool: str) -> bool:
-        """Check if a tool is installed (with caching)."""
         if tool in self.cache:
             return self.cache[tool]
+        
+        # Check if bundled with something already installed
+        if tool in self.BUNDLED_TOOLS:
+            parent = self.BUNDLED_TOOLS[tool]
+            if self.is_installed(parent):
+                self.cache[tool] = True
+                return True
         
         info = self.TOOLS.get(tool)
         if not info:
@@ -237,17 +596,16 @@ class DependencyManager:
                 capture_output=True, 
                 text=True, 
                 timeout=10,
-                shell=(sys.platform == 'win32' and len(info['check']) > 2)
+                shell=(sys.platform == 'win32')
             )
-            installed = result.returncode in (0, 1)  # Some tools return 1 for --version
+            installed = result.returncode in (0, 1)
             self.cache[tool] = installed
             return installed
         except:
             self.cache[tool] = False
             return False
     
-    def ensure(self, *tools: str, auto_install: bool = True) -> Dict[str, bool]:
-        """Ensure all listed tools are installed. Returns status dict."""
+    def ensure(self, *tools: str, auto_install: bool = True, cwd: str = None) -> Dict[str, bool]:
         results = {}
         missing = []
         
@@ -261,15 +619,48 @@ class DependencyManager:
         if missing and auto_install:
             log(f"Missing tools: {', '.join(missing)}")
             for tool in missing:
-                results[tool] = self._install(tool)
+                results[tool] = self._install(tool, cwd=cwd)
+                # If we installed a parent tool, check if bundled tools are now satisfied
+                for bundled, parent in self.BUNDLED_TOOLS.items():
+                    if parent == tool and results[tool]:
+                        self.cache[bundled] = True
+                        if bundled in missing:
+                            results[bundled] = True
         
         return results
     
-    def _install(self, tool: str) -> bool:
-        """Attempt to install a tool automatically."""
+    def _install(self, tool: str, cwd: str = None) -> bool:
         info = self.TOOLS.get(tool, {})
-        method = info.get('install', 'manual')
         
+        # Check if this tool is bundled with another
+        if tool in self.BUNDLED_TOOLS:
+            parent = self.BUNDLED_TOOLS[tool]
+            if self.is_installed(parent):
+                self.cache[tool] = True
+                return True
+            # Try to install the parent instead
+            log(f"{tool} is bundled with {parent}. Installing {parent}...")
+            return self._install(parent, cwd=cwd)
+        
+        # Handle base runtime installs (node, python, go, rust, java, cmake, mingw, ...)
+        install_fn = info.get('install_fn')
+        if install_fn:
+            installer_method = getattr(self.base_installer, f"install_{install_fn}", None)
+            if installer_method:
+                result = installer_method()
+                if result:
+                    self.cache[tool] = True
+                    # Also mark bundled tools as installed
+                    for bundled, parent in self.BUNDLED_TOOLS.items():
+                        if parent == tool:
+                            self.cache[bundled] = True
+                return result
+            else:
+                warn(f"No installer implemented for '{install_fn}' (tool: {tool})")
+                return False
+        
+        # Standard package manager installs
+        method = info.get('install', 'manual')
         log(f"Installing {tool} via {method}...")
         
         try:
@@ -277,34 +668,57 @@ class DependencyManager:
                 pkg = info.get('pkg', tool)
                 cmd = [sys.executable, "-m", "pip", "install", "--upgrade", pkg]
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-                return result.returncode == 0
+                if result.returncode == 0:
+                    self.cache[tool] = True
+                    return True
+                warn(f"pip install failed: {result.stderr[-400:] if result.stderr else 'unknown error'}")
+                return False
             
             elif method == 'npm':
                 pkg = info.get('pkg', tool)
+                # Ensure node/npm exists first
+                if not self.is_installed('node'):
+                    if not self._install('node'):
+                        return False
+                
                 cmd = ["npm", "install"]
                 if info.get('global', False):
                     cmd.append("-g")
                 cmd.append(pkg)
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-                return result.returncode == 0
+                # Local (non-global) packages must be installed into the target
+                # project directory, not wherever polybuild happens to be running from.
+                install_cwd = cwd if (cwd and not info.get('global', False)) else None
+                if install_cwd:
+                    os.makedirs(install_cwd, exist_ok=True)
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=180,
+                    cwd=install_cwd, shell=(sys.platform == 'win32')
+                )
+                if result.returncode == 0:
+                    self.cache[tool] = True
+                    return True
+                warn(f"npm install failed: {result.stderr[-400:] if result.stderr else 'unknown error'}")
+                return False
+            
+            elif method == 'pkgmgr':
+                if self.base_installer.install_via_pkgmgr(
+                    apt_pkg=info.get('apt_pkg'), brew_pkg=info.get('brew_pkg'),
+                    choco_pkg=info.get('choco_pkg'), winget_id=info.get('winget_id')
+                ):
+                    self.cache[tool] = True
+                    return True
+                return False
             
             elif method == 'choco':
-                if not self._has_choco():
-                    warn("Chocolatey not available. Cannot auto-install.")
-                    return False
                 pkg = info.get('pkg', tool)
-                result = subprocess.run(
-                    ["choco", "install", pkg, "-y", "--no-progress"],
-                    capture_output=True, text=True, timeout=300
-                )
-                return result.returncode == 0
-            
-            elif method == 'script':
-                warn(f"Please install {tool} manually from: {info.get('script', 'official website')}")
+                if self.base_installer.install_via_choco(pkg):
+                    self.cache[tool] = True
+                    return True
                 return False
             
             elif method == 'manual':
-                warn(f"Please install {tool} manually from: {info.get('url', 'official website')}")
+                url = info.get('url', 'official website')
+                warn(f"Please install {tool} manually from: {url}")
                 return False
             
             return False
@@ -312,19 +726,7 @@ class DependencyManager:
             warn(f"Failed to install {tool}: {e}")
             return False
     
-    def _has_choco(self) -> bool:
-        if self.choco_available is not None:
-            return self.choco_available
-        try:
-            result = subprocess.run(["choco", "--version"], capture_output=True, timeout=5)
-            self.choco_available = result.returncode == 0
-            return self.choco_available
-        except:
-            self.choco_available = False
-            return False
-    
     def update_project_deps(self, project_dir: str, lang: 'LangType'):
-        """Update project-specific dependencies."""
         log("Updating project dependencies...")
         
         if lang in (LangType.PYTHON,):
@@ -400,7 +802,6 @@ class DependencyManager:
 # ==================== PROJECT DETECTION ====================
 
 class LangType(Enum):
-    # General
     PYTHON = auto()
     NODE = auto()
     ELECTRON = auto()
@@ -414,25 +815,18 @@ class LangType(Enum):
     SCALA = auto()
     FLUTTER = auto()
     DART = auto()
-    
-    # Scripting
     LUA = auto()
     LOVE2D = auto()
     RUBY = auto()
     PERL = auto()
-    
-    # Systems
     NIM = auto()
     ZIG = auto()
     CRYSTAL = auto()
-    
-    # Game Engines
     GODOT = auto()
     UNITY = auto()
     UNREAL = auto()
     GAMEMAKER = auto()
     RENPY = auto()
-    
     UNKNOWN = auto()
 
 
@@ -445,22 +839,9 @@ class DetectedProject:
     framework: Optional[str] = None
     game_engine: Optional[str] = None
     notes: List[str] = field(default_factory=list)
-    
-    def to_dict(self):
-        return {
-            'lang': self.lang.name,
-            'confidence': self.confidence,
-            'entry_point': self.entry_point,
-            'build_files': self.build_files,
-            'framework': self.framework,
-            'game_engine': self.game_engine,
-            'notes': self.notes
-        }
 
 
 class ProjectDetector:
-    """Advanced multi-language project detector with game engine support."""
-    
     def __init__(self, project_dir: str):
         self.dir = os.path.abspath(project_dir)
         self.files = set()
@@ -478,6 +859,11 @@ class ProjectDetector:
     
     def _count(self, pattern: str) -> int:
         p = pattern.lower()
+        if p.startswith(".") and p.count(".") == 1:
+            # Plain extension (e.g. ".js", ".c"): match the real file extension
+            # rather than a substring, so "package.json" doesn't count as ".js"
+            # and "main.cpp" doesn't get double-counted as ".c".
+            return sum(1 for f in self.files if os.path.splitext(f)[1] == p)
         return sum(1 for f in self.files if p in f)
     
     def _find(self, *patterns: str) -> Optional[str]:
@@ -491,9 +877,7 @@ class ProjectDetector:
     def detect(self) -> DetectedProject:
         candidates = []
         
-        # ========== GAME ENGINES (highest priority) ==========
-        
-        # Godot
+        # ========== GAME ENGINES ==========
         godot_score = 0
         if self._has("project.godot"):
             godot_score += 100
@@ -507,7 +891,6 @@ class ProjectDetector:
                 game_engine="Godot", notes=["Godot Engine project detected"]
             ))
         
-        # Unity
         unity_score = 0
         if self._has("assets") and self._has("projectsettings"):
             unity_score += 60
@@ -523,7 +906,6 @@ class ProjectDetector:
                 game_engine="Unity", notes=["Unity project detected"]
             ))
         
-        # Unreal Engine
         unreal_score = 0
         if self._has(".uproject"):
             unreal_score += 100
@@ -537,7 +919,6 @@ class ProjectDetector:
                 game_engine="Unreal Engine", notes=["Unreal Engine project detected"]
             ))
         
-        # GameMaker
         gm_score = 0
         if self._has(".yyp"):
             gm_score += 100
@@ -549,7 +930,6 @@ class ProjectDetector:
                 game_engine="GameMaker", notes=["GameMaker Studio project detected"]
             ))
         
-        # Ren'Py
         renpy_score = 0
         if self._has("script.rpy") or self._has("options.rpy"):
             renpy_score += 100
@@ -561,7 +941,6 @@ class ProjectDetector:
                 game_engine="Ren'Py", notes=["Ren'Py visual novel detected"]
             ))
         
-        # Love2D
         love_score = 0
         if self._has("main.lua"):
             love_score += 80
@@ -577,8 +956,6 @@ class ProjectDetector:
             ))
         
         # ========== GENERAL LANGUAGES ==========
-        
-        # Python
         py_score = 0
         py_entry = None
         py_builds = []
@@ -591,8 +968,6 @@ class ProjectDetector:
             py_score += 20; py_builds.append("setup.py")
         if self._has("pipfile"):
             py_score += 15; py_builds.append("Pipfile")
-        if self._has("setup.cfg"):
-            py_score += 10; py_builds.append("setup.cfg")
         
         py_count = self._count(".py")
         if py_count > 0:
@@ -609,7 +984,6 @@ class ProjectDetector:
                 notes.append("GUI framework detected")
             candidates.append(DetectedProject(LangType.PYTHON, py_score, py_entry, py_builds, notes=notes))
         
-        # Node.js / Electron
         node_score = 0
         node_entry = None
         node_builds = []
@@ -623,8 +997,6 @@ class ProjectDetector:
                     deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
                     if "electron" in deps:
                         is_electron = True; node_score += 35
-                    if any(x in deps for x in ["react", "vue", "angular"]):
-                        node_score += 5
             except:
                 pass
         
@@ -632,23 +1004,37 @@ class ProjectDetector:
             node_score += 10
         if self._has("yarn.lock"):
             node_score += 10
-        if self._has("webpack.config.js"):
-            node_score += 5
         
         js_count = self._count(".js") + self._count(".ts") + self._count(".jsx") + self._count(".tsx")
         if js_count > 0:
             node_score += min(js_count, 20)
             node_entry = self._find("main.js", "index.js", "app.js", "main.ts", "index.ts", "electron.js")
         
+        # Plain/bundled web apps: no Node CLI entry point, but there's an index.html.
+        # This covers both static sites (just index.html/css/js) and bundler-based
+        # apps (Vite/CRA/webpack) whose "entry" for our purposes is the HTML shell.
+        has_index_html = self._has("index.html")
+        web_notes = []
+        if has_index_html and not node_entry:
+            node_entry = self._find("index.html")
+            if not node_builds:
+                # Static site with no package.json at all
+                node_score += 25
+                node_builds.append("index.html")
+            else:
+                # package.json present but it's a front-end app (Vite/CRA/etc),
+                # not a Node CLI script - still a web app entry.
+                node_score += 10
+            web_notes.append("Web app entry point (index.html)")
+        
         if node_score > 0:
             lang = LangType.ELECTRON if is_electron else LangType.NODE
             candidates.append(DetectedProject(
                 lang, node_score, node_entry, node_builds,
                 framework="Electron" if is_electron else None,
-                notes=[f"{js_count} JS/TS files"]
+                notes=[f"{js_count} JS/TS files"] + web_notes
             ))
         
-        # C/C++
         cpp_score = 0
         cpp_entry = None
         cpp_builds = []
@@ -661,10 +1047,6 @@ class ProjectDetector:
             cpp_score += 30; cpp_builds.append("meson.build")
         if self._has("configure.ac"):
             cpp_score += 20; cpp_builds.append("configure.ac")
-        if self._has("scons"):
-            cpp_score += 20; cpp_builds.append("SConstruct")
-        if self._has("premake5.lua"):
-            cpp_score += 25; cpp_builds.append("premake5.lua")
         if self._has("vcpkg.json"):
             cpp_score += 15; cpp_builds.append("vcpkg.json")
         
@@ -687,7 +1069,6 @@ class ProjectDetector:
                 notes=[f"{cpp_count} C++ / {c_count} C files"]
             ))
         
-        # C#
         cs_score = 0
         cs_entry = None
         cs_builds = []
@@ -707,14 +1088,11 @@ class ProjectDetector:
             framework = None
             if any("monogame" in f for f in self.files):
                 framework = "MonoGame"
-            elif any("unity" in f for f in self.files):
-                framework = "Unity Script"
             candidates.append(DetectedProject(
                 LangType.CSHARP, cs_score, cs_entry, cs_builds,
                 framework=framework, notes=[f"{cs_count} C# files"]
             ))
         
-        # Go
         go_score = 0
         go_entry = None
         go_builds = []
@@ -735,7 +1113,6 @@ class ProjectDetector:
                 notes=[f"{go_count} Go files"]
             ))
         
-        # Rust
         rust_score = 0
         rust_entry = None
         rust_builds = []
@@ -756,7 +1133,6 @@ class ProjectDetector:
                 notes=[f"{rs_count} Rust files"]
             ))
         
-        # Java
         java_score = 0
         java_entry = None
         java_builds = []
@@ -779,7 +1155,6 @@ class ProjectDetector:
                 notes=[f"{java_count} Java files"]
             ))
         
-        # Kotlin
         kt_score = 0
         if self._has(".kt") or self._has(".kts"):
             kt_count = self._count(".kt") + self._count(".kts")
@@ -792,7 +1167,6 @@ class ProjectDetector:
                     notes=[f"{kt_count} Kotlin files"]
                 ))
         
-        # Scala
         scala_score = 0
         if self._has(".scala") or self._has(".sbt"):
             scala_count = self._count(".scala")
@@ -805,7 +1179,6 @@ class ProjectDetector:
                     notes=[f"{scala_count} Scala files"]
                 ))
         
-        # Flutter/Dart
         flutter_score = 0
         flutter_entry = None
         flutter_builds = []
@@ -825,7 +1198,6 @@ class ProjectDetector:
                 notes=[f"{dart_count} Dart files"]
             ))
         
-        # Nim
         nim_score = 0
         if self._has(".nim") or self._has(".nims") or self._has(".nimble"):
             nim_count = self._count(".nim")
@@ -838,7 +1210,6 @@ class ProjectDetector:
                     notes=[f"{nim_count} Nim files"]
                 ))
         
-        # Zig
         zig_score = 0
         if self._has(".zig") or self._has("build.zig"):
             zig_count = self._count(".zig")
@@ -851,7 +1222,6 @@ class ProjectDetector:
                     notes=[f"{zig_count} Zig files"]
                 ))
         
-        # Crystal
         crystal_score = 0
         if self._has(".cr") or self._has("shard.yml"):
             cr_count = self._count(".cr")
@@ -864,7 +1234,6 @@ class ProjectDetector:
                     notes=[f"{cr_count} Crystal files"]
                 ))
         
-        # Ruby
         ruby_score = 0
         if self._has(".rb") or self._has("gemfile"):
             rb_count = self._count(".rb")
@@ -877,7 +1246,6 @@ class ProjectDetector:
                     notes=[f"{rb_count} Ruby files"]
                 ))
         
-        # Perl
         perl_score = 0
         if self._has(".pl") or self._has(".pm"):
             pl_count = self._count(".pl") + self._count(".pm")
@@ -888,26 +1256,17 @@ class ProjectDetector:
                     notes=[f"{pl_count} Perl files"]
                 ))
         
-        # Pick best
         if not candidates:
             return DetectedProject(LangType.UNKNOWN, 0, None, [], 
                 notes=["No recognizable project files found. Supported: Python, Node, C/C++, C#, Go, Rust, Java, Kotlin, Flutter, Lua/Love2D, Nim, Zig, Crystal, Ruby, Godot, Unity, Unreal, GameMaker, Ren'Py"])
         
         best = max(candidates, key=lambda x: x.confidence)
-        
-        # If Unity was detected but it's actually a C# project (not full Unity)
-        if best.lang == LangType.UNITY and best.confidence < 80:
-            # Check if it's just a C# project with Unity-like structure
-            pass  # Keep as Unity
-        
         return best
 
 
 # ==================== BUILDERS ====================
 
 class Builder:
-    """Base builder with dependency management."""
-    
     def __init__(self, project: DetectedProject, args, deps: DependencyManager):
         self.project = project
         self.args = args
@@ -920,9 +1279,13 @@ class Builder:
     def build(self) -> str:
         raise NotImplementedError
     
-    def _run(self, cmd: List[str], cwd: str = None, env=None, shell: bool = False) -> subprocess.CompletedProcess:
+    def _run(self, cmd: List[str], cwd: str = None, env=None, shell: bool = None) -> subprocess.CompletedProcess:
         if self.args.verbose:
             log(f"Executing: {' '.join(cmd)}")
+        if shell is None:
+            # On Windows, many build tools (npm, npx, pkg, yarn...) are .cmd/.bat
+            # shims that subprocess can't resolve without going through the shell.
+            shell = (sys.platform == 'win32')
         return subprocess.run(
             cmd, cwd=cwd or self.project_dir,
             capture_output=not self.args.verbose,
@@ -978,7 +1341,6 @@ class PythonBuilder(Builder):
         if self.args.icon and os.path.exists(self.args.icon):
             cmd.extend(["--icon", os.path.abspath(self.args.icon)])
         
-        # Auto-detect
         if self.args.auto_detect:
             for h in self._detect_hidden_imports():
                 cmd.extend(["--hidden-import", h])
@@ -1081,6 +1443,19 @@ class NodeBuilder(Builder):
         
         if self.project.lang == LangType.ELECTRON:
             return self._build_electron()
+        
+        entry = self.args.script or self.project.entry_point
+        # A web app (plain static site, or a Vite/CRA/webpack front-end) has an
+        # HTML entry rather than a Node CLI script - `pkg` can't turn that into
+        # an EXE, so it needs to go through the Electron-wrapper path instead.
+        if entry and entry.lower().endswith((".html", ".htm")):
+            return self._build_web_app()
+        if not entry:
+            html_fallback = self._find_file("index.html")
+            js_fallback = os.path.exists(os.path.join(self.project_dir, "index.js"))
+            if html_fallback and not js_fallback:
+                return self._build_web_app()
+        
         return self._build_node()
     
     def _build_node(self) -> str:
@@ -1090,7 +1465,6 @@ class NodeBuilder(Builder):
         if not os.path.exists(os.path.join(self.project_dir, entry)):
             error(f"Entry point not found: {entry}")
         
-        # Install deps if needed
         if os.path.exists(os.path.join(self.project_dir, "package.json")):
             if not os.path.exists(os.path.join(self.project_dir, "node_modules")):
                 log("Installing npm dependencies...")
@@ -1099,30 +1473,128 @@ class NodeBuilder(Builder):
         out = os.path.join(self.dist_dir, f"{self.name}.exe")
         cmd = ["pkg", entry, "--target", "node18-win-x64", "--output", out]
         
-        # Compress with UPX if available
         if self.deps.is_installed('upx') and self.args.onefile:
-            cmd.append("--compress", "GZip")
+            cmd.extend(["--compress", "GZip"])
         
         result = self._run(cmd)
         return self._print_result(out) or error("pkg build failed")
     
+    def _build_web_app(self) -> str:
+        """Build a browser-facing web app (index.html, optionally bundler-built)
+        into a desktop EXE by staging it inside a generated Electron shell."""
+        pkg_path = os.path.join(self.project_dir, "package.json")
+        has_pkg = os.path.exists(pkg_path)
+        pkg = {}
+        if has_pkg:
+            try:
+                with open(pkg_path, 'r', encoding='utf-8') as f:
+                    pkg = json.load(f)
+            except Exception:
+                pkg = {}
+        
+        web_root = self.project_dir
+        
+        # If this is a bundler-based app (Vite/CRA/webpack/etc.), run its build
+        # script first and use the compiled output instead of the raw source.
+        if has_pkg and "build" in pkg.get("scripts", {}):
+            if not os.path.exists(os.path.join(self.project_dir, "node_modules")):
+                log("Installing npm dependencies...")
+                self._run(["npm", "install"])
+            log("Running 'npm run build'...")
+            result = self._run(["npm", "run", "build"])
+            if result.returncode != 0:
+                error("npm run build failed")
+            for candidate in ("dist", "build", "out", "public"):
+                candidate_path = os.path.join(self.project_dir, candidate)
+                if os.path.exists(os.path.join(candidate_path, "index.html")):
+                    web_root = candidate_path
+                    break
+        
+        # Ensure electron + electron-builder are available (installed into the
+        # project directory, not wherever polybuild itself happens to run from)
+        self.deps.ensure('electron', 'electron-builder', cwd=self.project_dir)
+        
+        # Stage the (built) web assets inside a self-contained Electron wrapper
+        stage_dir = os.path.join(self.dist_dir, "_electron_stage")
+        if os.path.exists(stage_dir):
+            shutil.rmtree(stage_dir)
+        app_dir = os.path.join(stage_dir, "app")
+        shutil.copytree(web_root, app_dir, ignore=shutil.ignore_patterns("node_modules", ".git"))
+        
+        icon_line = ""
+        if self.args.icon and os.path.exists(self.args.icon):
+            icon_line = f", icon: {json.dumps(os.path.abspath(self.args.icon))}"
+        
+        main_js = f"""const {{ app, BrowserWindow }} = require('electron');
+const path = require('path');
+
+function createWindow() {{
+  const win = new BrowserWindow({{
+    width: 1280,
+    height: 800{icon_line},
+    webPreferences: {{ contextIsolation: true }}
+  }});
+  win.loadFile(path.join(__dirname, 'index.html'));
+  if ({str(bool(self.args.console)).lower()}) {{
+    win.webContents.openDevTools();
+  }}
+}}
+
+app.whenReady().then(createWindow);
+app.on('window-all-closed', () => {{ if (process.platform !== 'darwin') app.quit(); }});
+"""
+        with open(os.path.join(app_dir, "main.js"), 'w', encoding='utf-8') as f:
+            f.write(main_js)
+        
+        build_config = {
+            "appId": f"com.polybuild.{self.name}",
+            "productName": self.name,
+            "directories": {"output": self.dist_dir},
+            "files": ["**/*"],
+            "win": {"target": "portable" if self.args.onefile else "nsis"}
+        }
+        if self.args.icon and os.path.exists(self.args.icon):
+            build_config["win"]["icon"] = os.path.abspath(self.args.icon)
+        
+        wrapper_pkg = {
+            "name": re.sub(r'[^a-z0-9-]', '-', self.name.lower()) or "polybuild-app",
+            "version": "1.0.0",
+            "private": True,
+            "main": "main.js",
+            "build": build_config
+        }
+        with open(os.path.join(app_dir, "package.json"), 'w', encoding='utf-8') as f:
+            json.dump(wrapper_pkg, f, indent=2)
+        
+        log("Installing Electron inside the build wrapper...")
+        self._run(["npm", "install", "--no-save", "electron", "electron-builder"], cwd=app_dir)
+        
+        cmd = ["npx", "electron-builder", "--win", "--x64", "--publish", "never"]
+        result = self._run(cmd, cwd=app_dir)
+        
+        for f in os.listdir(self.dist_dir):
+            if f.endswith(".exe"):
+                return self._print_result(os.path.join(self.dist_dir, f)) or error("Output issue")
+        error("Web app build produced no EXE")
+    
     def _build_electron(self) -> str:
-        self.deps.ensure('electron-builder')
+        self.deps.ensure('electron-builder', cwd=self.project_dir)
         
         pkg_path = os.path.join(self.project_dir, "package.json")
         with open(pkg_path, 'r') as f:
             pkg = json.load(f)
         
-        # Inject build config if missing
         if "build" not in pkg:
+            win_config = {"target": "portable" if self.args.onefile else "nsis"}
+            if self.args.icon and os.path.exists(self.args.icon):
+                win_config["icon"] = os.path.abspath(self.args.icon)
+            elif os.path.exists(os.path.join(self.project_dir, "assets", "icon.ico")):
+                win_config["icon"] = "assets/icon.ico"
             pkg["build"] = {
                 "appId": f"com.polybuild.{self.name}",
                 "productName": self.name,
                 "directories": {"output": self.dist_dir},
-                "win": {
-                    "target": "portable" if self.args.onefile else "nsis",
-                    "icon": self.args.icon or "assets/icon.ico"
-                }
+                "win": win_config
             }
             with open(pkg_path, 'w') as f:
                 json.dump(pkg, f, indent=2)
@@ -1133,7 +1605,6 @@ class NodeBuilder(Builder):
         cmd = ["npx", "electron-builder", "--win", "--x64", "--publish", "never"]
         result = self._run(cmd)
         
-        # Find output
         for f in os.listdir(self.dist_dir):
             if f.endswith(".exe"):
                 return self._print_result(os.path.join(self.dist_dir, f)) or error("Output issue")
@@ -1286,12 +1757,19 @@ class RustBuilder(Builder):
         env = os.environ.copy()
         env["RUSTFLAGS"] = "-C target-feature=+crt-static"
         
-        # Check Windows target
-        check = subprocess.run(["rustup", "target", "list", "--installed"], 
-                             capture_output=True, text=True)
-        if "x86_64-pc-windows-gnu" not in check.stdout and sys.platform != "win32":
+        try:
+            check = subprocess.run(["rustup", "target", "list", "--installed"],
+                                 capture_output=True, text=True, timeout=30)
+            have_gnu_target = "x86_64-pc-windows-gnu" in check.stdout
+        except Exception:
+            have_gnu_target = False
+        
+        if not have_gnu_target and sys.platform != "win32":
             log("Installing Windows cross-compile target...")
-            subprocess.run(["rustup", "target", "add", "x86_64-pc-windows-gnu"])
+            try:
+                subprocess.run(["rustup", "target", "add", "x86_64-pc-windows-gnu"], timeout=180)
+            except Exception as e:
+                warn(f"Could not add cross-compile target: {e}")
             target = "x86_64-pc-windows-gnu"
         else:
             target = "x86_64-pc-windows-msvc" if sys.platform == "win32" else "x86_64-pc-windows-gnu"
@@ -1418,7 +1896,6 @@ class JavaBuilder(Builder):
     
     def _build_manual(self) -> str:
         jar = self._compile_jar()
-        # Create batch wrapper or use launch4j if available
         warn("Creating basic JAR output. Use --onefile for native EXE via jpackage.")
         return jar
 
@@ -1442,7 +1919,6 @@ class FlutterBuilder(Builder):
                     if f.endswith(".exe"):
                         dest = os.path.join(self.dist_dir, f)
                         shutil.copy2(os.path.join(d, f), dest)
-                        # Copy DLLs
                         for dll in glob.glob(os.path.join(d, "*.dll")):
                             shutil.copy2(dll, self.dist_dir)
                         return self._print_result(dest) or dest
@@ -1453,24 +1929,19 @@ class LuaBuilder(Builder):
     def build(self) -> str:
         self.deps.ensure('love')
         
-        # Create .love file then bundle with love.exe
         love_file = os.path.join(self.dist_dir, f"{self.name}.love")
         
         with zipfile.ZipFile(love_file, 'w', zipfile.ZIP_DEFLATED) as zf:
             for root, _, files in os.walk(self.project_dir):
                 for f in files:
-                    if f.endswith('.lua') or f.endswith('.png') or f.endswith('.jpg') or \
-                       f.endswith('.ogg') or f.endswith('.wav') or f.endswith('.ttf') or \
-                       f.endswith('.json') or f.endswith('.xml'):
+                    if f.endswith(('.lua', '.png', '.jpg', '.ogg', '.wav', '.ttf', '.json', '.xml')):
                         full = os.path.join(root, f)
                         arc = os.path.relpath(full, self.project_dir)
                         zf.write(full, arc)
         
-        # Find love.exe
         love_exe = shutil.which("love")
         if not love_exe:
-            # Try common locations
-            for path in ["C:\\Program Files\\LOVE\\love.exe", "C:\\Program Files (x86)\\LOVE\\love.exe"]:
+            for path in [r"C:\Program Files\LOVE\love.exe", r"C:\Program Files (x86)\LOVE\love.exe"]:
                 if os.path.exists(path):
                     love_exe = path
                     break
@@ -1478,7 +1949,6 @@ class LuaBuilder(Builder):
         if not love_exe:
             error("love.exe not found. Install LÖVE2D.")
         
-        # Combine love.exe + game.love
         out = os.path.join(self.dist_dir, f"{self.name}.exe")
         with open(love_exe, 'rb') as f:
             love_data = f.read()
@@ -1497,8 +1967,7 @@ class GodotBuilder(Builder):
     def build(self) -> str:
         self.deps.ensure('godot')
         
-        # Godot exports via command line
-        export_preset = "Windows Desktop"  # Common preset name
+        export_preset = "Windows Desktop"
         out = os.path.join(self.dist_dir, f"{self.name}.exe")
         
         cmd = [
@@ -1563,7 +2032,6 @@ class RubyBuilder(Builder):
         warn("Ruby to EXE requires OCRA. Attempting install...")
         self.deps.ensure('ruby')
         
-        # Try OCRA
         try:
             subprocess.run(["gem", "install", "ocra"], capture_output=True, timeout=60)
         except:
@@ -1626,7 +2094,6 @@ Examples:
         """
     )
     
-    # Core
     parser.add_argument("--project", "-p", help="Project directory")
     parser.add_argument("--script", "-s", help="Override entry point")
     parser.add_argument("--name", "-n", help="Output EXE name")
@@ -1637,9 +2104,8 @@ Examples:
         "java", "kotlin", "scala", "flutter", "dart", "lua", "love2d",
         "nim", "zig", "crystal", "ruby", "perl", "godot", "unity", "unreal",
         "gamemaker", "renpy"
-    ], help="Force language (skip auto-detect)")
+    ], help="Force language (skip auto-detection)")
     
-    # Build options
     parser.add_argument("--onefile", "-f", action="store_true", help="Single executable")
     parser.add_argument("--console", "-c", action="store_true", help="Keep console window")
     parser.add_argument("--backend", choices=["auto", "pyinstaller", "nuitka"], default="auto")
@@ -1648,7 +2114,6 @@ Examples:
     parser.add_argument("--hidden-imports", action="append")
     parser.add_argument("--add-data", action="append")
     
-    # Maintenance
     parser.add_argument("--update", action="store_true", help="Update PolyBuild to latest version")
     parser.add_argument("--update-deps", action="store_true", help="Update project dependencies before build")
     parser.add_argument("--check-tools", action="store_true", help="Check all build tools status")
@@ -1657,7 +2122,6 @@ Examples:
     
     args = parser.parse_args()
     
-    # Banner
     print(f"""{Colors.CYAN}{Colors.BOLD}
     ╔═══════════════════════════════════════════════════════════════╗
     ║  POLYBUILD PRO v{VERSION:<8} - Universal EXE Builder            ║
@@ -1665,16 +2129,13 @@ Examples:
     ╚═══════════════════════════════════════════════════════════════╝{Colors.END}
     """)
     
-    # Self-update
     if args.update:
         SelfUpdater.check_update(force=True)
         return
     
-    # Check for updates silently first
     if not args.check_tools:
         SelfUpdater.check_update(force=False)
     
-    # Init config
     if args.init:
         template = {
             "version": VERSION,
@@ -1692,7 +2153,6 @@ Examples:
         success("Created polybuild.json")
         return
     
-    # Check tools
     if args.check_tools:
         deps = DependencyManager()
         tools = list(deps.TOOLS.keys())
@@ -1704,12 +2164,10 @@ Examples:
             print(f"  {status:<20} {tool:<20} ({info_type})")
         return
     
-    # Determine project
     project_dir = os.path.abspath(args.project or ".")
     if not os.path.isdir(project_dir):
         error(f"Directory not found: {project_dir}")
     
-    # Detect or force language
     if args.lang:
         lang_map = {
             "python": LangType.PYTHON, "node": LangType.NODE, "electron": LangType.ELECTRON,
@@ -1729,7 +2187,6 @@ Examples:
         detector = ProjectDetector(project_dir)
         detected = detector.detect()
     
-    # Display detection
     print(f"\n{Colors.BOLD}{'─'*50}{Colors.END}")
     print(f"{Colors.BOLD}Detection Results:{Colors.END}")
     print(f"  Language:     {Colors.CYAN}{detected.lang.name}{Colors.END}")
@@ -1751,13 +2208,11 @@ Examples:
     if detected.confidence < 30:
         warn("Low confidence detection. Verify with --lang or check project structure.")
     
-    # Dependency management
     deps = DependencyManager()
     
     if args.update_deps:
         deps.update_project_deps(project_dir, detected.lang)
     
-    # Build
     builder_class = BUILDERS.get(detected.lang)
     if not builder_class:
         error(f"No builder available for {detected.lang.name}")

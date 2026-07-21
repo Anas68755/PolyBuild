@@ -1514,30 +1514,18 @@ class NodeBuilder(Builder):
         # project directory, not wherever polybuild itself happens to run from)
         self.deps.ensure('electron', 'electron-builder', cwd=self.project_dir)
         
-        # Stage the (built) web assets inside a self-contained Electron wrapper.
-        # IMPORTANT: this must live somewhere completely outside both the
-        # project directory and self.dist_dir. If it were nested inside either
-        # (e.g. self.dist_dir defaults to "dist", and a Vite build's output
-        # folder is *also* named "dist"), shutil.copytree would end up copying
-        # that folder into a subdirectory of itself, recursing forever and
-        # producing an endless chain of nested "useless" folders.
-        stage_dir = tempfile.mkdtemp(prefix="polybuild_electron_")
+        # Stage the (built) web assets inside a self-contained Electron wrapper
+        stage_dir = os.path.join(self.dist_dir, "_electron_stage")
+        if os.path.exists(stage_dir):
+            shutil.rmtree(stage_dir)
         app_dir = os.path.join(stage_dir, "app")
-        try:
-            web_root_abs = os.path.abspath(web_root)
-            dist_dir_abs = os.path.abspath(self.dist_dir)
-            skip_names = {"node_modules", ".git", "_electron_stage"}
-            # Never copy polybuild's own output directory into the staged app,
-            # even if it happens to live inside web_root (defense in depth).
-            if os.path.dirname(dist_dir_abs) == web_root_abs or dist_dir_abs == web_root_abs:
-                skip_names.add(os.path.basename(dist_dir_abs))
-            shutil.copytree(web_root, app_dir, ignore=shutil.ignore_patterns(*skip_names))
-            
-            icon_line = ""
-            if self.args.icon and os.path.exists(self.args.icon):
-                icon_line = f", icon: {json.dumps(os.path.abspath(self.args.icon))}"
-            
-            main_js = f"""const {{ app, BrowserWindow }} = require('electron');
+        shutil.copytree(web_root, app_dir, ignore=shutil.ignore_patterns("node_modules", ".git"))
+        
+        icon_line = ""
+        if self.args.icon and os.path.exists(self.args.icon):
+            icon_line = f", icon: {json.dumps(os.path.abspath(self.args.icon))}"
+        
+        main_js = f"""const {{ app, BrowserWindow }} = require('electron');
 const path = require('path');
 
 function createWindow() {{
@@ -1555,43 +1543,39 @@ function createWindow() {{
 app.whenReady().then(createWindow);
 app.on('window-all-closed', () => {{ if (process.platform !== 'darwin') app.quit(); }});
 """
-            with open(os.path.join(app_dir, "main.js"), 'w', encoding='utf-8') as f:
-                f.write(main_js)
-            
-            build_config = {
-                "appId": f"com.polybuild.{self.name}",
-                "productName": self.name,
-                "directories": {"output": self.dist_dir},
-                "files": ["**/*"],
-                "win": {"target": "portable" if self.args.onefile else "nsis"}
-            }
-            if self.args.icon and os.path.exists(self.args.icon):
-                build_config["win"]["icon"] = os.path.abspath(self.args.icon)
-            
-            wrapper_pkg = {
-                "name": re.sub(r'[^a-z0-9-]', '-', self.name.lower()) or "polybuild-app",
-                "version": "1.0.0",
-                "private": True,
-                "main": "main.js",
-                "build": build_config
-            }
-            with open(os.path.join(app_dir, "package.json"), 'w', encoding='utf-8') as f:
-                json.dump(wrapper_pkg, f, indent=2)
-            
-            log("Installing Electron inside the build wrapper...")
-            self._run(["npm", "install", "--no-save", "electron", "electron-builder"], cwd=app_dir)
-            
-            cmd = ["npx", "electron-builder", "--win", "--x64", "--publish", "never"]
-            result = self._run(cmd, cwd=app_dir)
-            
-            for f in os.listdir(self.dist_dir):
-                if f.endswith(".exe"):
-                    return self._print_result(os.path.join(self.dist_dir, f)) or error("Output issue")
-            error("Web app build produced no EXE")
-        finally:
-            # Always clean up the temp stage, win or lose - it's scratch space,
-            # never the actual output.
-            shutil.rmtree(stage_dir, ignore_errors=True)
+        with open(os.path.join(app_dir, "main.js"), 'w', encoding='utf-8') as f:
+            f.write(main_js)
+        
+        build_config = {
+            "appId": f"com.polybuild.{self.name}",
+            "productName": self.name,
+            "directories": {"output": self.dist_dir},
+            "files": ["**/*"],
+            "win": {"target": "portable" if self.args.onefile else "nsis"}
+        }
+        if self.args.icon and os.path.exists(self.args.icon):
+            build_config["win"]["icon"] = os.path.abspath(self.args.icon)
+        
+        wrapper_pkg = {
+            "name": re.sub(r'[^a-z0-9-]', '-', self.name.lower()) or "polybuild-app",
+            "version": "1.0.0",
+            "private": True,
+            "main": "main.js",
+            "build": build_config
+        }
+        with open(os.path.join(app_dir, "package.json"), 'w', encoding='utf-8') as f:
+            json.dump(wrapper_pkg, f, indent=2)
+        
+        log("Installing Electron inside the build wrapper...")
+        self._run(["npm", "install", "--no-save", "electron", "electron-builder"], cwd=app_dir)
+        
+        cmd = ["npx", "electron-builder", "--win", "--x64", "--publish", "never"]
+        result = self._run(cmd, cwd=app_dir)
+        
+        for f in os.listdir(self.dist_dir):
+            if f.endswith(".exe"):
+                return self._print_result(os.path.join(self.dist_dir, f)) or error("Output issue")
+        error("Web app build produced no EXE")
     
     def _build_electron(self) -> str:
         self.deps.ensure('electron-builder', cwd=self.project_dir)

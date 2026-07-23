@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-PolyBuild Pro v2.3.2 - Universal App & Game Builder (EXE / APK / Native)
-Auto-detects 25+ languages, self-updates, auto-manages & installs dependencies.
-"""
 
 import os
 import sys
@@ -20,13 +16,13 @@ import platform
 import ast
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple, Set
+from typing import List, Dict, Optional, Set
 from enum import Enum, auto
 from datetime import datetime
 
 
 # ==================== VERSION & UPDATE ====================
-VERSION = "2.3.2"
+VERSION = "2.3.3"
 UPDATE_URL = os.environ.get("POLYBUILD_UPDATE_URL", "")
 VERSION_CHECK_URL = os.environ.get("POLYBUILD_VERSION_URL", "")
 
@@ -46,6 +42,9 @@ def dim(msg): print(f"{Colors.DIM}{msg}{Colors.END}")
 
 # ==================== HELPERS ====================
 
+# Used for source-tree scanning during language detection — safe to
+# exclude 'build'/'dist' here since we don't want stale generated output
+# skewing detection scores.
 EXCLUDED_DIRS: Set[str] = {
     '.git', 'node_modules', '__pycache__', '.venv', 'venv', 'env',
     '.idea', '.vscode', 'target', 'zig-cache', 'zig-out',
@@ -53,6 +52,12 @@ EXCLUDED_DIRS: Set[str] = {
     '.next', '.nuxt', '.svelte-kit', '.angular',
     'Pods', '.symlinks', 'dist', 'build',
 }
+
+# FIX (v2.3.3): a separate, much smaller exclusion set for walking BUILD
+# OUTPUT looking for artifacts (APKs, etc). Artifacts always live under a
+# "build" directory, so EXCLUDED_DIRS (which excludes "build") must never
+# be reused here or the search can never find anything.
+ARTIFACT_SEARCH_EXCLUDED_DIRS: Set[str] = {'.git', 'node_modules'}
 
 def exe_ext(target_os: str = "native") -> str:
     if target_os == "windows": return ".exe"
@@ -91,11 +96,32 @@ class SelfUpdater:
                 new_code = resp.read().decode('utf-8')
             if 'sha256' in update_data and hashlib.sha256(new_code.encode()).hexdigest() != update_data['sha256']:
                 error("Update verification failed (hash mismatch)")
-            ast.parse(new_code)
+
+            # Validate it's at least parseable Python before overwriting anything.
+            try:
+                ast.parse(new_code)
+            except SyntaxError as e:
+                error(f"Update validation failed (invalid Python): {e}")
+
             script_path = os.path.abspath(sys.argv[0])
-            shutil.copy2(script_path, script_path + ".backup")
-            with open(script_path, 'w', encoding='utf-8') as f: f.write(new_code)
+            backup_path = script_path + ".backup"
+            shutil.copy2(script_path, backup_path)
+            with open(script_path, 'w', encoding='utf-8') as f:
+                f.write(new_code)
+
             success(f"Updated to v{update_data['version']}! Restart to use new version.")
+
+            # FIX (v2.3.3, restored): ast.parse() only proves the code is
+            # syntactically valid — it doesn't catch things like an
+            # indentation edge case that trips up bytecode compilation,
+            # or a truncated download. Byte-compile and roll back on failure.
+            try:
+                import py_compile
+                py_compile.compile(script_path, doraise=True)
+            except Exception as rollback_err:
+                warn(f"New script failed compile check, rolling back: {rollback_err}")
+                shutil.copy2(backup_path, script_path)
+                error("Update rolled back — downloaded code would not compile")
             return True
         except Exception as e:
             error(f"Update failed: {e}")
@@ -134,9 +160,9 @@ class BaseToolInstaller:
         return result.returncode == 0
 
     def install_via_pkgmgr(self, apt_pkg=None, brew_pkg=None, choco_pkg=None, winget_id=None) -> bool:
-        if sys.platform == "win32": return (winget_id and self.install_via_winget(winget_id)) or (choco_pkg and self.install_via_choco(choco_pkg))
-        elif sys.platform == "darwin": return brew_pkg and self.install_via_brew(brew_pkg)
-        elif sys.platform.startswith("linux"): return apt_pkg and self.install_via_apt(apt_pkg)
+        if sys.platform == "win32": return bool((winget_id and self.install_via_winget(winget_id)) or (choco_pkg and self.install_via_choco(choco_pkg)))
+        elif sys.platform == "darwin": return bool(brew_pkg and self.install_via_brew(brew_pkg))
+        elif sys.platform.startswith("linux"): return bool(apt_pkg and self.install_via_apt(apt_pkg))
         return False
 
     def install_nodejs(self) -> bool: return self.install_via_pkgmgr(apt_pkg="nodejs npm", brew_pkg="node", choco_pkg="nodejs", winget_id="OpenJS.NodeJS")
@@ -336,7 +362,7 @@ class ProjectDetector:
 
     def detect(self) -> DetectedProject:
         candidates = []
-        
+
         if self._has("project.godot"): candidates.append(DetectedProject(LangType.GODOT, 100, "project.godot", ["project.godot"], game_engine="Godot"))
         if self._has_dir("assets") and self._has_dir("projectsettings"): candidates.append(DetectedProject(LangType.UNITY, 60, None, [], game_engine="Unity"))
         if self._has(".uproject"): candidates.append(DetectedProject(LangType.UNREAL, 100, None, [], game_engine="Unreal Engine"))
@@ -349,19 +375,24 @@ class ProjectDetector:
             try:
                 with open(os.path.join(self.dir, gf), 'r', encoding='utf-8') as fh:
                     content = fh.read()
-                    # FIX: Read content once to prevent stream exhaustion
                     if 'com.android.application' in content or 'com.android.tools.build' in content:
                         android_score += 50; android_builds.append(gf); break
             except Exception: pass
         if android_score > 0: candidates.append(DetectedProject(LangType.ANDROID, android_score, None, android_builds))
 
+        # FIX (v2.3.3): don't nest the candidate-append inside `if py_count > 0`
+        # — a project can legitimately score (e.g. requirements.txt present)
+        # even if this particular scan pass counted zero .py files, and the
+        # previous structure silently dropped that candidate entirely.
         py_score = 30 if self._has("requirements.txt") else 0
         py_count = self._count(".py")
+        py_entry = None
         if py_count > 0:
             py_score += min(py_count * 3, 25)
             py_entry = self._find("main.py", "app.py", "run.py", "gui.py", "__main__.py", "start.py", "game.py")
             if py_entry: py_score += 10
-            candidates.append(DetectedProject(LangType.PYTHON, py_score, py_entry, ["requirements.txt"] if py_score else []))
+        if py_score > 0:
+            candidates.append(DetectedProject(LangType.PYTHON, py_score, py_entry, ["requirements.txt"] if self._has("requirements.txt") else []))
 
         node_score = 0; node_entry = None; is_electron = False
         pkg_jsons = self._find_all("package.json")
@@ -370,7 +401,6 @@ class ProjectDetector:
             for pj in pkg_jsons:
                 try:
                     with open(os.path.join(self.dir, pj), 'r', encoding='utf-8') as f:
-                        # FIX: Parse JSON once to prevent stream exhaustion
                         pkg_data = json.load(f)
                         deps = {**pkg_data.get("dependencies", {}), **pkg_data.get("devDependencies", {})}
                         if "electron" in deps:
@@ -383,11 +413,19 @@ class ProjectDetector:
         if node_score > 0:
             candidates.append(DetectedProject(LangType.ELECTRON if is_electron else LangType.NODE, node_score, node_entry, ["package.json"], framework="Electron" if is_electron else None))
 
+        # FIX (v2.3.3): same un-nesting issue as Python — a CMakeLists.txt-only
+        # header library should still register as a CPP candidate.
         cpp_score = 40 if self._has("CMakeLists.txt") else 0
+        if self._has("Makefile"): cpp_score += 30
         c_count = self._count(".c"); cpp_count = self._count(".cpp") + self._count(".cc") + self._count(".cxx")
-        if cpp_count > 0 or c_count > 0:
+        h_count = self._count(".h") + self._count(".hpp")
+        if cpp_count > 0: cpp_score += min(cpp_count * 3, 25)
+        if c_count > 0: cpp_score += min(c_count * 2, 15)
+        if h_count > 0: cpp_score += min(h_count, 10)
+        if cpp_score > 0:
             cpp_entry = self._find("main.cpp", "main.c", "winmain.cpp")
-            candidates.append(DetectedProject(LangType.CPP if cpp_count >= c_count else LangType.C, cpp_score, cpp_entry, ["CMakeLists.txt"] if cpp_score else []))
+            build_files = [f for f in ("CMakeLists.txt", "Makefile") if self._has(f)]
+            candidates.append(DetectedProject(LangType.CPP if cpp_count >= c_count else LangType.C, cpp_score, cpp_entry, build_files))
 
         cs_score = 50 if self._has(".csproj") else 0
         if cs_score: candidates.append(DetectedProject(LangType.CSHARP, cs_score, self._find("Program.cs", "Main.cs"), [f for f in self.files if f.lower().endswith(".csproj")]))
@@ -401,12 +439,41 @@ class ProjectDetector:
         java_score = 40 if self._has("pom.xml") or self._has("build.gradle") else 0
         if java_score: candidates.append(DetectedProject(LangType.JAVA, java_score, self._find("Main.java"), ["pom.xml"] if self._has("pom.xml") else ["build.gradle"]))
 
+        # FIX (v2.3.3, restored): Kotlin/Scala/Ruby/Crystal/Perl detection was
+        # missing entirely from this revision, even though JavaBuilder (used
+        # for Kotlin/Scala), RubyBuilder, and CrystalBuilder are all present
+        # and wired up in BUILDERS below. Without this, those projects always
+        # detected as UNKNOWN and required --lang to build at all.
+        kt_count = self._count(".kt") + self._count(".kts")
+        if kt_count > 0:
+            kt_score = min(kt_count * 5, 40) + (30 if self._has("build.gradle.kts") else 0)
+            candidates.append(DetectedProject(LangType.KOTLIN, kt_score, None, []))
+
+        scala_count = self._count(".scala")
+        if scala_count > 0 or self._has("build.sbt"):
+            scala_score = min(scala_count * 5, 40) + (40 if self._has("build.sbt") else 0)
+            candidates.append(DetectedProject(LangType.SCALA, scala_score, None, []))
+
+        rb_count = self._count(".rb")
+        if rb_count > 0 or self._has("Gemfile"):
+            ruby_score = min(rb_count * 5, 30) + (30 if self._has("Gemfile") else 0)
+            candidates.append(DetectedProject(LangType.RUBY, ruby_score, self._find("main.rb", "game.rb"), []))
+
+        cr_count = self._count(".cr")
+        if cr_count > 0 or self._has("shard.yml"):
+            crystal_score = min(cr_count * 10, 50) + (40 if self._has("shard.yml") else 0)
+            candidates.append(DetectedProject(LangType.CRYSTAL, crystal_score, self._find("main.cr", "game.cr"), []))
+
+        pl_count = self._count(".pl") + self._count(".pm")
+        if pl_count > 0:
+            candidates.append(DetectedProject(LangType.PERL, min(pl_count * 5, 30), self._find("main.pl"), []))
+
         flutter_score = 50 if self._has("pubspec.yaml") else 0
         if flutter_score: candidates.append(DetectedProject(LangType.FLUTTER, flutter_score, "lib/main.dart" if self._has("lib/main.dart") else None, ["pubspec.yaml"]))
 
         nim_score = 30 if self._has(".nimble") else 0
         if nim_score: candidates.append(DetectedProject(LangType.NIM, nim_score, self._find("main.nim"), []))
-        
+
         zig_score = 40 if self._has("build.zig") else 0
         if zig_score: candidates.append(DetectedProject(LangType.ZIG, zig_score, self._find("main.zig"), ["build.zig"]))
 
@@ -434,6 +501,10 @@ class Builder:
         if shell is None: shell = (sys.platform == 'win32')
         return subprocess.run(cmd, cwd=cwd or self.project_dir, capture_output=not self.args.verbose, text=True, env=env or os.environ.copy(), shell=shell, timeout=600)
 
+    def _find_file(self, pattern: str) -> Optional[str]:
+        matches = glob.glob(os.path.join(self.project_dir, pattern), recursive=True)
+        return matches[0] if matches else None
+
     def _print_result(self, artifact_path: str):
         if os.path.exists(artifact_path):
             size = os.path.getsize(artifact_path) / (1024*1024)
@@ -448,7 +519,6 @@ class Builder:
         for f in os.listdir(self.dist_dir):
             full = os.path.join(self.dist_dir, f)
             if os.path.isfile(full) and f.lower().endswith(ext):
-                # FIX: Try/except to prevent crashes on locked files (e.g. AV scanning)
                 try: os.remove(full)
                 except Exception: pass
 
@@ -526,7 +596,16 @@ class NodeBuilder(Builder):
         entry = self.args.script or self.project.entry_point or "index.js"
         ext = exe_ext(self.target_os)
         out = os.path.join(self.dist_dir, f"{self.name}{ext}")
-        cmd = ["pkg", entry, "--output", out, "--target", "node18-win-x64" if self.target_os == "windows" else f"node18-{sys.platform}-x64"]
+        # FIX (v2.3.3): sys.platform is "darwin" on macOS, not "macos" — pkg's
+        # target strings are node18-{win|macos|linux}-x64. Using raw
+        # sys.platform produced an invalid "node18-darwin-x64" target.
+        if self.target_os == "windows" or sys.platform == "win32":
+            pkg_target = "node18-win-x64"
+        elif sys.platform == "darwin":
+            pkg_target = "node18-macos-x64"
+        else:
+            pkg_target = "node18-linux-x64"
+        cmd = ["pkg", entry, "--output", out, "--target", pkg_target]
         result = self._run(cmd)
         if result.returncode != 0: error("pkg build failed")
         return self._print_result(out) or error("pkg build failed")
@@ -547,7 +626,6 @@ class NodeBuilder(Builder):
         stage_dir = os.path.join(self.dist_dir, "_electron_stage")
         if os.path.exists(stage_dir): shutil.rmtree(stage_dir)
         app_dir = os.path.join(stage_dir, "app")
-        # FIX: Added dist, build, out to ignore_patterns to prevent recursive copy crash
         shutil.copytree(web_root, app_dir, ignore=shutil.ignore_patterns("node_modules", ".git", "dist", "build", "out"))
 
         with open(os.path.join(app_dir, "main.js"), 'w') as f:
@@ -568,9 +646,8 @@ class NodeBuilder(Builder):
     def _build_electron(self) -> str:
         pkg_path = os.path.join(self.project_dir, "package.json")
         with open(pkg_path, 'r') as f: pkg = json.load(f)
-        
+
         config = pkg.get("build", {})
-        # FIX: Merge directories instead of overwriting, preserving buildResources
         config["directories"] = {**(config.get("directories", {})), "output": self.dist_dir}
         config_path = os.path.join(self.dist_dir, "electron-builder-config.json")
         with open(config_path, 'w') as f: json.dump(config, f, indent=2)
@@ -589,32 +666,61 @@ class CppBuilder(Builder):
     def build(self) -> str:
         if os.path.exists(os.path.join(self.project_dir, "CMakeLists.txt")):
             self.deps.ensure('cmake')
-            build_dir = os.path.join(self.project_dir, "build")
-            os.makedirs(build_dir, exist_ok=True)
-            gen = "Visual Studio 17 2022" if sys.platform == "win32" else "Unix Makefiles"
-            self._run(["cmake", "..", f"-G{gen}", "-DCMAKE_BUILD_TYPE=Release"], cwd=build_dir)
-            self._run(["cmake", "--build", ".", "--config", "Release"], cwd=build_dir)
-            ext = exe_ext(self.target_os)
-            exe = self._find_exe_in(build_dir)
-            if exe:
-                dest = os.path.join(self.dist_dir, f"{self.name}{ext}")
-                shutil.copy2(exe, dest)
-                return self._print_result(dest) or dest
-            error("No executable found in build output")
+            return self._build_cmake()
+        elif os.path.exists(os.path.join(self.project_dir, "Makefile")):
+            # FIX (v2.3.3, restored): a Makefile-only C/C++ project was
+            # previously falling through to a naive single-shot gcc/g++
+            # invocation, which silently mis-builds anything relying on the
+            # Makefile's own flags, link order, or multiple targets.
+            self.deps.ensure('make', 'gcc')
+            return self._build_make()
         else:
             self.deps.ensure('gcc')
-            entry = self.args.script or self.project.entry_point or "main.cpp"
-            compiler = "g++" if entry.endswith((".cpp", ".cc", ".cxx")) else "gcc"
-            ext = exe_ext(self.target_os)
-            out = os.path.join(self.dist_dir, f"{self.name}{ext}")
-            cmd = [compiler, "-O2", "-o", out, os.path.join(self.project_dir, entry)]
-            for pattern in ["*.c", "*.cpp", "*.cc", "*.cxx"]:
-                for f in glob.glob(os.path.join(self.project_dir, pattern)):
-                    if os.path.basename(f) != os.path.basename(entry): cmd.append(f)
-            result = self._run(cmd)
-            if result.returncode != 0: error("Compilation failed")
-            if sys.platform != "win32": os.chmod(out, 0o755)
-            return self._print_result(out) or error("Compilation failed")
+            return self._build_direct()
+
+    def _build_cmake(self) -> str:
+        build_dir = os.path.join(self.project_dir, "build")
+        os.makedirs(build_dir, exist_ok=True)
+        gen = "Visual Studio 17 2022" if sys.platform == "win32" else "Unix Makefiles"
+        result = self._run(["cmake", "..", f"-G{gen}", "-DCMAKE_BUILD_TYPE=Release"], cwd=build_dir)
+        if result.returncode != 0: error("CMake configuration failed")
+        result = self._run(["cmake", "--build", ".", "--config", "Release"], cwd=build_dir)
+        if result.returncode != 0: error("CMake build failed")
+        ext = exe_ext(self.target_os)
+        exe = self._find_exe_in(build_dir)
+        if exe:
+            dest = os.path.join(self.dist_dir, f"{self.name}{ext}")
+            shutil.copy2(exe, dest)
+            return self._print_result(dest) or dest
+        error("No executable found in build output")
+
+    def _build_make(self) -> str:
+        env = os.environ.copy()
+        env["CC"] = "gcc"; env["CXX"] = "g++"
+        env["CFLAGS"] = "-O2"; env["CXXFLAGS"] = "-O2"
+        result = self._run(["make", "-j4"], env=env)
+        if result.returncode != 0: error("Make build failed")
+        ext = exe_ext(self.target_os)
+        exe = self._find_exe_in(self.project_dir)
+        if exe:
+            dest = os.path.join(self.dist_dir, f"{self.name}{ext}")
+            shutil.copy2(exe, dest)
+            return self._print_result(dest) or dest
+        error("No executable found")
+
+    def _build_direct(self) -> str:
+        entry = self.args.script or self.project.entry_point or "main.cpp"
+        compiler = "g++" if entry.endswith((".cpp", ".cc", ".cxx")) else "gcc"
+        ext = exe_ext(self.target_os)
+        out = os.path.join(self.dist_dir, f"{self.name}{ext}")
+        cmd = [compiler, "-O2", "-o", out, os.path.join(self.project_dir, entry)]
+        for pattern in ["*.c", "*.cpp", "*.cc", "*.cxx"]:
+            for f in glob.glob(os.path.join(self.project_dir, pattern)):
+                if os.path.basename(f) != os.path.basename(entry): cmd.append(f)
+        result = self._run(cmd)
+        if result.returncode != 0: error("Compilation failed")
+        if sys.platform != "win32": os.chmod(out, 0o755)
+        return self._print_result(out) or error("Compilation failed")
 
     def _find_exe_in(self, directory: str) -> Optional[str]:
         ext = exe_ext(self.target_os)
@@ -634,7 +740,7 @@ class CSharpBuilder(Builder):
         self.deps.ensure('dotnet')
         csproj = next((f for f in self.project.build_files if f.endswith(".csproj")), self._find_file("*.csproj"))
         if not csproj: error("No .csproj file found")
-        rid = "win-x64" if self.target_os == "windows" else "linux-x64" if sys.platform.startswith("linux") else "osx-x64"
+        rid = self._get_rid()
         cmd = ["dotnet", "publish", csproj, "-c", "Release", "-r", rid, "--self-contained", "true", "-o", self.dist_dir]
         if self.args.onefile: cmd.extend(["-p:PublishSingleFile=true", "-p:EnableCompressionInSingleFile=true"])
         result = self._run(cmd)
@@ -642,6 +748,20 @@ class CSharpBuilder(Builder):
         ext = exe_ext(self.target_os)
         exe_path = next((os.path.join(self.dist_dir, f) for f in os.listdir(self.dist_dir) if os.path.isfile(os.path.join(self.dist_dir, f)) and f.lower().endswith(ext)), None)
         return self._print_result(exe_path) or error("dotnet publish output not found")
+
+    def _get_rid(self) -> str:
+        # FIX (v2.3.3): the previous version only special-cased
+        # target_os == "windows" (never true for the default "native"), then
+        # fell straight through linux/else to "osx-x64" — meaning a plain
+        # native build run *on Windows itself* published for macOS. Handle
+        # native win32/darwin/linux explicitly, same as cross-compile windows.
+        if self.target_os == "windows" or (self.target_os == "native" and sys.platform == "win32"):
+            return "win-x64"
+        if self.target_os == "native" and sys.platform == "darwin":
+            return "osx-arm64" if platform.machine() == "arm64" else "osx-x64"
+        if sys.platform.startswith("linux"):
+            return "linux-x64"
+        return "osx-x64"
 
 
 class GoBuilder(Builder):
@@ -653,7 +773,7 @@ class GoBuilder(Builder):
         env = os.environ.copy()
         if self.target_os == "windows": env["GOOS"] = "windows"; env["GOARCH"] = "amd64"
         ldflags = "-s -w"
-        if not self.args.console and (self.target_os == "windows" or sys.platform == "win32"): ldflags += " -H=windowsgui"
+        if not self.args.console and (self.target_os == "windows" or (self.target_os == "native" and sys.platform == "win32")): ldflags += " -H=windowsgui"
         cmd = ["go", "build", f"-ldflags={ldflags}", "-o", out, entry if os.path.isdir(os.path.join(self.project_dir, entry)) else os.path.join(self.project_dir, entry)]
         result = self._run(cmd, env=env)
         if result.returncode != 0: error("Go build failed")
@@ -669,19 +789,26 @@ class RustBuilder(Builder):
         if target: cmd.extend(["--target", target])
         result = self._run(cmd)
         if result.returncode != 0: error("Cargo build failed")
-        
+
         ext = exe_ext(self.target_os)
         crate_name = self._get_crate_name()
         exe_name = f"{crate_name}{ext}"
-        target_dir = os.path.join(self.project_dir, "target", target, "release", exe_name) if target else os.path.join(self.project_dir, "target", "release", exe_name)
-        
+        release_dir = os.path.join(self.project_dir, "target", target, "release") if target else os.path.join(self.project_dir, "target", "release")
+        target_dir = os.path.join(release_dir, exe_name)
+
         if not os.path.exists(target_dir):
-            search_dir = os.path.join(self.project_dir, "target", target, "release") if target else os.path.join(self.project_dir, "target", "release")
-            for root, _, files in os.walk(search_dir):
-                for f in files:
-                    if f.lower().endswith(ext) and not f.startswith("lib") and not f.startswith("deps"):
-                        target_dir = os.path.join(root, f); break
-        
+            # FIX (v2.3.3): look only at the top level of the release dir
+            # (not a recursive os.walk into deps/ or incremental/), and stop
+            # at the first real match instead of letting the loop's `break`
+            # merely exit the inner iteration while os.walk kept going and
+            # could overwrite target_dir with a wrong file from deps/.
+            if os.path.isdir(release_dir):
+                for f in sorted(os.listdir(release_dir)):
+                    full = os.path.join(release_dir, f)
+                    if os.path.isfile(full) and f.lower().endswith(ext) and not f.startswith("lib"):
+                        target_dir = full
+                        break
+
         dest = os.path.join(self.dist_dir, f"{self.name}{ext}")
         if os.path.exists(target_dir):
             shutil.copy2(target_dir, dest)
@@ -689,6 +816,10 @@ class RustBuilder(Builder):
         return self._print_result(dest) or error("Rust build output not found")
 
     def _get_crate_name(self) -> str:
+        # FIX (v2.3.3): do NOT replace '-' with '_' here. Cargo only maps a
+        # hyphenated package name to an underscored *library* identifier —
+        # the compiled *binary* on disk keeps the hyphens exactly as written
+        # in Cargo.toml (e.g. package "my-cool-app" -> target/release/my-cool-app).
         try:
             with open(os.path.join(self.project_dir, "Cargo.toml"), 'r') as f:
                 in_package = False
@@ -697,9 +828,9 @@ class RustBuilder(Builder):
                     if s.startswith('['): in_package = (s == '[package]')
                     if in_package:
                         m = re.match(r'name\s*=\s*["\'](.+?)["\']', s)
-                        if m: return m.group(1).replace('-', '_')
+                        if m: return m.group(1)
         except Exception: pass
-        return self.name.replace('-', '_')
+        return self.name
 
 
 class JavaBuilder(Builder):
@@ -708,7 +839,10 @@ class JavaBuilder(Builder):
         if self.deps.is_installed('jpackage') and self.args.onefile: return self._build_jpackage()
         elif os.path.exists(os.path.join(self.project_dir, "build.gradle")): return self._build_gradle()
         elif os.path.exists(os.path.join(self.project_dir, "pom.xml")): return self._build_maven()
-        else: return self._compile_jar()
+        else:
+            jar = self._compile_jar()
+            warn("Created basic JAR. Use --onefile for a native EXE via jpackage.")
+            return jar
 
     def _build_jpackage(self) -> str:
         jar = self._compile_jar()
@@ -724,15 +858,17 @@ class JavaBuilder(Builder):
         if not java_files: error("No Java files found")
         classes = os.path.join(self.dist_dir, "classes")
         os.makedirs(classes, exist_ok=True)
-        
-        # FIX: Use tempfile for argfile and quote paths to prevent space crashes
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            argfile = f.name
-            for jf in java_files: f.write(f'"{jf}"\n')
-        result = self._run(["javac", "-d", classes, f"@{argfile}"])
-        os.remove(argfile)
+
+        argfile = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                argfile = f.name
+                for jf in java_files: f.write(f'"{jf}"\n')
+            result = self._run(["javac", "-d", classes, f"@{argfile}"])
+        finally:
+            if argfile and os.path.exists(argfile): os.remove(argfile)
         if result.returncode != 0: error("Java compilation failed")
-        
+
         main_class = self._find_main_class(java_files)
         jar = os.path.join(self.dist_dir, f"{self.name}.jar")
         manifest = os.path.join(self.dist_dir, "MANIFEST.MF")
@@ -745,7 +881,8 @@ class JavaBuilder(Builder):
     def _find_main_class(self, java_files: List[str]) -> Optional[str]:
         for f in java_files:
             try:
-                content = open(f, 'r', errors='ignore').read()
+                with open(f, 'r', errors='ignore') as fh:
+                    content = fh.read()
                 if 'public static void main' in content:
                     package = None
                     for line in content.split('\n'):
@@ -786,12 +923,11 @@ class AndroidBuilder(Builder):
         if not os.path.exists(wrapper):
             if self.deps.is_installed('gradle'): wrapper = "gradle"
             else: error("No Gradle wrapper found.")
-        # FIX: Explicitly check wrapper != "gradle" to avoid chmodding global binary
         if wrapper != "gradle" and sys.platform != "win32" and os.path.exists(wrapper):
             os.chmod(wrapper, 0o755)
-        
+
         self._clean_dist_artifacts(".apk")
-        
+
         for task in ["assembleRelease", "assembleDebug"]:
             log(f"Running Gradle {task}...")
             result = self._run([wrapper, task, "--no-daemon"])
@@ -816,8 +952,14 @@ class AndroidBuilder(Builder):
                 for root, _, files in os.walk(search_dir):
                     for f in files:
                         if f.endswith(".apk"): return os.path.join(root, f)
+        # FIX (v2.3.3): this fallback must NOT reuse EXCLUDED_DIRS — that set
+        # now contains 'build' and 'dist', and Gradle/Flutter APK output
+        # always lives under a directory named "build". Reusing it made this
+        # "search the whole project" fallback structurally incapable of
+        # finding anything, defeating its purpose. Use a minimal exclusion
+        # set instead, and still skip our own output directory.
         for root, dirs, files in os.walk(self.project_dir):
-            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and os.path.join(root, d) != self.dist_dir]
+            dirs[:] = [d for d in dirs if d not in ARTIFACT_SEARCH_EXCLUDED_DIRS and os.path.join(root, d) != self.dist_dir]
             for f in files:
                 if f.endswith(".apk"): return os.path.join(root, f)
         return None
@@ -845,12 +987,11 @@ class FlutterBuilder(Builder):
         result = self._run(["flutter", "build", build_target, "--release"])
         if result.returncode != 0: error(f"Flutter {build_target} build failed")
         ext = exe_ext(self.target_os)
-        # FIX: Added Linux "bundle" directory to search paths
         build_dirs = [
             os.path.join(self.project_dir, "build", build_target, "x64", "runner", "Release"),
             os.path.join(self.project_dir, "build", build_target, "runner", "Release"),
-            os.path.join(self.project_dir, "build", build_target, "x64", "release", "bundle"), # Linux
-            os.path.join(self.project_dir, "build", build_target, "x64", "bundle")
+            os.path.join(self.project_dir, "build", build_target, "x64", "release", "bundle"),  # Linux
+            os.path.join(self.project_dir, "build", build_target, "x64", "bundle"),
         ]
         for d in build_dirs:
             if os.path.exists(d):
@@ -876,9 +1017,9 @@ class LuaBuilder(Builder):
         if not love_exe: error("love executable not found. Install LÖVE2D.")
         ext = exe_ext(self.target_os)
         out = os.path.join(self.dist_dir, f"{self.name}{ext}")
-        with open(out, 'wb') as f:
-            f.write(open(love_exe, 'rb').read())
-            f.write(open(love_file, 'rb').read())
+        with open(out, 'wb') as f, open(love_exe, 'rb') as le, open(love_file, 'rb') as lf:
+            f.write(le.read())
+            f.write(lf.read())
         os.remove(love_file)
         if sys.platform != "win32": os.chmod(out, 0o755)
         return self._print_result(out) or error("Love2D build failed")
@@ -889,7 +1030,8 @@ class GodotBuilder(Builder):
         self.deps.ensure('godot')
         cfg_path = os.path.join(self.project_dir, "export_presets.cfg")
         if not os.path.exists(cfg_path): error("No export_presets.cfg found. Configure exports in Godot first.")
-        names = re.findall(r'name\s*=\s*"([^"]+)"', open(cfg_path, 'r').read())
+        with open(cfg_path, 'r') as f:
+            names = re.findall(r'name\s*=\s*"([^"]+)"', f.read())
         if not names: error("No export presets defined in export_presets.cfg")
         export_preset = names[0]
         ext = exe_ext(self.target_os)
@@ -1032,7 +1174,7 @@ def main():
 
     deps = DependencyManager()
     builder_class = BUILDERS.get(detected.lang)
-    
+
     if args.target_os == "android":
         if detected.lang in (LangType.FLUTTER, LangType.DART): builder_class = FlutterBuilder
         elif detected.lang in (LangType.JAVA, LangType.KOTLIN, LangType.ANDROID): builder_class = AndroidBuilder
@@ -1046,6 +1188,7 @@ def main():
         artifact_path = builder.build()
         elapsed = (datetime.now() - start_time).total_seconds()
         print(f"\n{Colors.GREEN}{Colors.BOLD}BUILD SUCCESSFUL")
+        print(f"Output: {artifact_path}")
         print(f"Time: {elapsed:.1f}s{Colors.END}\n")
     except KeyboardInterrupt:
         warn("\nBuild interrupted by user"); sys.exit(1)

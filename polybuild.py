@@ -1,16 +1,7 @@
 #!/usr/bin/env python3
 """
-PolyBuild Pro v2.3.1 - Universal App & Game Builder (EXE / APK / Native)
+PolyBuild Pro v2.3.2 - Universal App & Game Builder (EXE / APK / Native)
 Auto-detects 25+ languages, self-updates, auto-manages & installs dependencies.
-
-FIXES (v2.3.1):
-  - Java: Uses @argfile to prevent command-line length crashes on large projects
-  - Rust: Fallback to recursive search for binaries in workspaces/multi-bin crates
-  - Electron: Prioritizes top-level installers over win-unpacked/ executables
-  - Android: Fixed assembleRelease fallback logic and stale APK discovery in dist/
-  - Python: Better fallback entry point detection (avoids picking utils.py)
-  - C++: Restrictive globbing to prevent compiling .cache/.class files
-  - Electron: Forces output directory to dist/ even if user config exists
 """
 
 import os
@@ -35,41 +26,22 @@ from datetime import datetime
 
 
 # ==================== VERSION & UPDATE ====================
-VERSION = "2.3.1"
+VERSION = "2.3.2"
 UPDATE_URL = os.environ.get("POLYBUILD_UPDATE_URL", "")
 VERSION_CHECK_URL = os.environ.get("POLYBUILD_VERSION_URL", "")
 
 
 class Colors:
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    BLUE = '\033[94m'
-    CYAN = '\033[96m'
-    MAGENTA = '\033[95m'
-    BOLD = '\033[1m'
-    DIM = '\033[2m'
-    END = '\033[0m'
+    GREEN = '\033[92m'; YELLOW = '\033[93m'; RED = '\033[91m'
+    BLUE = '\033[94m'; CYAN = '\033[96m'; MAGENTA = '\033[95m'
+    BOLD = '\033[1m'; DIM = '\033[2m'; END = '\033[0m'
 
-
-def log(msg, color=Colors.BLUE):
-    print(f"{color}[*] {msg}{Colors.END}")
-
-def success(msg):
-    print(f"{Colors.GREEN}[✓] {msg}{Colors.END}")
-
-def warn(msg):
-    print(f"{Colors.YELLOW}[!] {msg}{Colors.END}")
-
-def error(msg):
-    print(f"{Colors.RED}[✗] {msg}{Colors.END}")
-    sys.exit(1)
-
-def info(msg):
-    print(f"{Colors.CYAN}[i] {msg}{Colors.END}")
-
-def dim(msg):
-    print(f"{Colors.DIM}{msg}{Colors.END}")
+def log(msg, color=Colors.BLUE): print(f"{color}[*] {msg}{Colors.END}")
+def success(msg): print(f"{Colors.GREEN}[✓] {msg}{Colors.END}")
+def warn(msg): print(f"{Colors.YELLOW}[!] {msg}{Colors.END}")
+def error(msg): print(f"{Colors.RED}[✗] {msg}{Colors.END}"); sys.exit(1)
+def info(msg): print(f"{Colors.CYAN}[i] {msg}{Colors.END}")
+def dim(msg): print(f"{Colors.DIM}{msg}{Colors.END}")
 
 
 # ==================== HELPERS ====================
@@ -82,12 +54,9 @@ EXCLUDED_DIRS: Set[str] = {
     'Pods', '.symlinks', 'dist', 'build',
 }
 
-
 def exe_ext(target_os: str = "native") -> str:
-    if target_os == "windows":
-        return ".exe"
-    if target_os == "native":
-        return ".exe" if sys.platform == "win32" else ""
+    if target_os == "windows": return ".exe"
+    if target_os == "native": return ".exe" if sys.platform == "win32" else ""
     return ""
 
 
@@ -96,24 +65,17 @@ def exe_ext(target_os: str = "native") -> str:
 class SelfUpdater:
     @staticmethod
     def check_update(force: bool = False) -> bool:
-        if not VERSION_CHECK_URL or not UPDATE_URL:
-            return False
+        if not VERSION_CHECK_URL or not UPDATE_URL: return False
         try:
             req = urllib.request.Request(VERSION_CHECK_URL, headers={'User-Agent': 'PolyBuild-Updater'})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 remote_data = json.loads(resp.read().decode('utf-8'))
             remote_version = remote_data.get('version', '0.0.0')
             if SelfUpdater._version_compare(remote_version, VERSION) > 0:
-                pad = max(0, 21 - len(VERSION) - len(remote_version))
-                print(f"\n{Colors.YELLOW}╔═══════════════════════════════════════════════════╗")
-                print(f"║  Update available: v{VERSION} → v{remote_version}{' ' * pad}║")
-                print(f"║  {remote_data.get('changelog', 'Bug fixes and improvements.')[:47]:<47} ║")
-                print(f"╚═══════════════════════════════════════════════════╝{Colors.END}\n")
                 if force or input("Update now? [Y/n]: ").lower() in ('', 'y', 'yes'):
                     return SelfUpdater._perform_update(remote_data)
             return False
-        except Exception:
-            return False
+        except Exception: return False
 
     @staticmethod
     def _version_compare(v1: str, v2: str) -> int:
@@ -132,8 +94,7 @@ class SelfUpdater:
             ast.parse(new_code)
             script_path = os.path.abspath(sys.argv[0])
             shutil.copy2(script_path, script_path + ".backup")
-            with open(script_path, 'w', encoding='utf-8') as f:
-                f.write(new_code)
+            with open(script_path, 'w', encoding='utf-8') as f: f.write(new_code)
             success(f"Updated to v{update_data['version']}! Restart to use new version.")
             return True
         except Exception as e:
@@ -173,18 +134,12 @@ class BaseToolInstaller:
         return result.returncode == 0
 
     def install_via_pkgmgr(self, apt_pkg=None, brew_pkg=None, choco_pkg=None, winget_id=None) -> bool:
-        if sys.platform == "win32":
-            return (winget_id and self.install_via_winget(winget_id)) or (choco_pkg and self.install_via_choco(choco_pkg))
-        elif sys.platform == "darwin":
-            return brew_pkg and self.install_via_brew(brew_pkg)
-        elif sys.platform.startswith("linux"):
-            return apt_pkg and self.install_via_apt(apt_pkg)
+        if sys.platform == "win32": return (winget_id and self.install_via_winget(winget_id)) or (choco_pkg and self.install_via_choco(choco_pkg))
+        elif sys.platform == "darwin": return brew_pkg and self.install_via_brew(brew_pkg)
+        elif sys.platform.startswith("linux"): return apt_pkg and self.install_via_apt(apt_pkg)
         return False
 
-    def install_nodejs(self) -> bool:
-        if self.install_via_pkgmgr(apt_pkg="nodejs npm", brew_pkg="node", choco_pkg="nodejs", winget_id="OpenJS.NodeJS"): return True
-        return False
-
+    def install_nodejs(self) -> bool: return self.install_via_pkgmgr(apt_pkg="nodejs npm", brew_pkg="node", choco_pkg="nodejs", winget_id="OpenJS.NodeJS")
     def install_python(self) -> bool: return False
     def install_git(self) -> bool: return self.install_via_pkgmgr(apt_pkg="git", brew_pkg="git", choco_pkg="git", winget_id="Git.Git")
     def install_go(self) -> bool: return self.install_via_pkgmgr(apt_pkg="golang-go", brew_pkg="go", choco_pkg="golang", winget_id="GoLang.Go")
@@ -241,7 +196,6 @@ class DependencyManager:
         'aapt': {'check': ['aapt', 'version'], 'install': 'pkgmgr', 'apt_pkg': 'aapt'},
         'adb': {'check': ['adb', 'version'], 'install_fn': 'android_sdk'},
     }
-
     BUNDLED_TOOLS = {'npm': 'node', 'npx': 'node', 'javac': 'java', 'jpackage': 'java', 'rustc': 'cargo'}
 
     def __init__(self):
@@ -251,33 +205,23 @@ class DependencyManager:
     def is_installed(self, tool: str) -> bool:
         if tool in self.cache: return self.cache[tool]
         if tool in self.BUNDLED_TOOLS and self.is_installed(self.BUNDLED_TOOLS[tool]):
-            self.cache[tool] = True
-            return True
-
+            self.cache[tool] = True; return True
         tool_info = self.TOOLS.get(tool)
-        if not tool_info:
-            self.cache[tool] = False
-            return False
-
+        if not tool_info: self.cache[tool] = False; return False
         try:
             result = subprocess.run(tool_info['check'], capture_output=True, text=True, timeout=10, shell=(sys.platform == 'win32'))
             installed = result.returncode == 0
             self.cache[tool] = installed
             return installed
         except Exception:
-            self.cache[tool] = False
-            return False
+            self.cache[tool] = False; return False
 
     def ensure(self, *tools: str, auto_install: bool = True, cwd: str = None) -> Dict[str, bool]:
         results = {}
         missing = []
         for tool in tools:
-            if self.is_installed(tool):
-                results[tool] = True
-            else:
-                results[tool] = False
-                missing.append(tool)
-
+            if self.is_installed(tool): results[tool] = True
+            else: results[tool] = False; missing.append(tool)
         if missing and auto_install:
             for tool in missing:
                 results[tool] = self._install(tool, cwd=cwd)
@@ -291,11 +235,8 @@ class DependencyManager:
         tool_info = self.TOOLS.get(tool, {})
         if tool in self.BUNDLED_TOOLS:
             parent = self.BUNDLED_TOOLS[tool]
-            if self.is_installed(parent):
-                self.cache[tool] = True
-                return True
+            if self.is_installed(parent): self.cache[tool] = True; return True
             return self._install(parent, cwd=cwd)
-
         install_fn = tool_info.get('install_fn')
         if install_fn:
             installer_method = getattr(self.base_installer, f"install_{install_fn}", None)
@@ -307,15 +248,12 @@ class DependencyManager:
                         if parent == tool: self.cache[bundled] = True
                 return result
             return False
-
         method = tool_info.get('install', 'manual')
         try:
             if method == 'pip':
                 cmd = [sys.executable, "-m", "pip", "install", "--upgrade", tool_info.get('pkg', tool)]
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-                if result.returncode == 0:
-                    self.cache[tool] = True
-                    return True
+                if result.returncode == 0: self.cache[tool] = True; return True
                 return False
             elif method == 'npm':
                 pkg = tool_info.get('pkg', tool)
@@ -326,18 +264,14 @@ class DependencyManager:
                 install_cwd = cwd if (cwd and not tool_info.get('global', False)) else None
                 if install_cwd: os.makedirs(install_cwd, exist_ok=True)
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, cwd=install_cwd, shell=(sys.platform == 'win32'))
-                if result.returncode == 0:
-                    self.cache[tool] = True
-                    return True
+                if result.returncode == 0: self.cache[tool] = True; return True
                 return False
             elif method == 'pkgmgr':
                 if self.base_installer.install_via_pkgmgr(apt_pkg=tool_info.get('apt_pkg'), brew_pkg=tool_info.get('brew_pkg'), choco_pkg=tool_info.get('choco_pkg'), winget_id=tool_info.get('winget_id')):
-                    self.cache[tool] = True
-                    return True
+                    self.cache[tool] = True; return True
                 return False
             return False
-        except Exception:
-            return False
+        except Exception: return False
 
 
 # ==================== PROJECT DETECTION ====================
@@ -393,8 +327,7 @@ class ProjectDetector:
             pl = p.lower()
             for f in self.files:
                 fl = f.lower()
-                if fl == pl or fl.endswith("/" + pl):
-                    return f
+                if fl == pl or fl.endswith("/" + pl): return f
         return None
 
     def _find_all(self, pattern: str) -> List[str]:
@@ -404,26 +337,20 @@ class ProjectDetector:
     def detect(self) -> DetectedProject:
         candidates = []
         
-        godot_score = 100 if self._has("project.godot") else 0
-        if godot_score: candidates.append(DetectedProject(LangType.GODOT, godot_score, "project.godot", ["project.godot"], game_engine="Godot"))
-        
-        unity_score = 60 if (self._has_dir("assets") and self._has_dir("projectsettings")) else 0
-        if unity_score: candidates.append(DetectedProject(LangType.UNITY, unity_score, None, [], game_engine="Unity"))
-        
-        unreal_score = 100 if self._has(".uproject") else 0
-        if unreal_score: candidates.append(DetectedProject(LangType.UNREAL, unreal_score, None, [], game_engine="Unreal Engine"))
-        
-        love_score = 80 if self._has("main.lua") else 0
-        if love_score: candidates.append(DetectedProject(LangType.LOVE2D, love_score, "main.lua", [], game_engine="LÖVE"))
+        if self._has("project.godot"): candidates.append(DetectedProject(LangType.GODOT, 100, "project.godot", ["project.godot"], game_engine="Godot"))
+        if self._has_dir("assets") and self._has_dir("projectsettings"): candidates.append(DetectedProject(LangType.UNITY, 60, None, [], game_engine="Unity"))
+        if self._has(".uproject"): candidates.append(DetectedProject(LangType.UNREAL, 100, None, [], game_engine="Unreal Engine"))
+        if self._has("main.lua"): candidates.append(DetectedProject(LangType.LOVE2D, 80, "main.lua", [], game_engine="LÖVE"))
 
-        android_score = 0
-        android_builds = []
+        android_score = 0; android_builds = []
         if self._has("AndroidManifest.xml"):
             android_score += 80; android_builds.append("AndroidManifest.xml")
         for gf in self._find_all("build.gradle") + self._find_all("build.gradle.kts"):
             try:
                 with open(os.path.join(self.dir, gf), 'r', encoding='utf-8') as fh:
-                    if 'com.android.application' in fh.read() or 'com.android.tools.build' in fh.read():
+                    content = fh.read()
+                    # FIX: Read content once to prevent stream exhaustion
+                    if 'com.android.application' in content or 'com.android.tools.build' in content:
                         android_score += 50; android_builds.append(gf); break
             except Exception: pass
         if android_score > 0: candidates.append(DetectedProject(LangType.ANDROID, android_score, None, android_builds))
@@ -443,7 +370,10 @@ class ProjectDetector:
             for pj in pkg_jsons:
                 try:
                     with open(os.path.join(self.dir, pj), 'r', encoding='utf-8') as f:
-                        if "electron" in {**json.load(f).get("dependencies", {}), **json.load(f).get("devDependencies", {})}:
+                        # FIX: Parse JSON once to prevent stream exhaustion
+                        pkg_data = json.load(f)
+                        deps = {**pkg_data.get("dependencies", {}), **pkg_data.get("devDependencies", {})}
+                        if "electron" in deps:
                             is_electron = True; node_score += 35; break
                 except Exception: pass
         js_count = self._count(".js") + self._count(".ts") + self._count(".jsx") + self._count(".tsx")
@@ -480,8 +410,7 @@ class ProjectDetector:
         zig_score = 40 if self._has("build.zig") else 0
         if zig_score: candidates.append(DetectedProject(LangType.ZIG, zig_score, self._find("main.zig"), ["build.zig"]))
 
-        if not candidates:
-            return DetectedProject(LangType.UNKNOWN, 0, None, [], notes=["No recognizable project files found."])
+        if not candidates: return DetectedProject(LangType.UNKNOWN, 0, None, [], notes=["No recognizable project files found."])
         return max(candidates, key=lambda x: x.confidence)
 
 
@@ -519,26 +448,24 @@ class Builder:
         for f in os.listdir(self.dist_dir):
             full = os.path.join(self.dist_dir, f)
             if os.path.isfile(full) and f.lower().endswith(ext):
-                os.remove(full)
+                # FIX: Try/except to prevent crashes on locked files (e.g. AV scanning)
+                try: os.remove(full)
+                except Exception: pass
 
     def _find_dist_artifact(self, ext: str) -> Optional[str]:
-        """FIX: Prioritize top-level artifacts to avoid picking unpacked exes."""
+        """Prioritize top-level artifacts to avoid picking unpacked exes."""
         candidates = []
-        # 1. Search top-level of dist_dir
         for f in os.listdir(self.dist_dir):
             full = os.path.join(self.dist_dir, f)
             if os.path.isfile(full) and f.lower().endswith(ext):
                 candidates.append(full)
-        if candidates:
-            return max(candidates, key=lambda x: os.path.getmtime(x))
-        # 2. Search subdirectories, skipping staging/unpacked dirs
+        if candidates: return max(candidates, key=lambda x: os.path.getmtime(x))
         for root, dirs, files in os.walk(self.dist_dir):
             dirs[:] = [d for d in dirs if not d.startswith('_') and d.lower() not in ('win-unpacked', 'mac', 'linux')]
             for f in files:
                 if f.lower().endswith(ext):
                     candidates.append(os.path.join(root, f))
-        if candidates:
-            return max(candidates, key=lambda x: os.path.getmtime(x))
+        if candidates: return max(candidates, key=lambda x: os.path.getmtime(x))
         return None
 
 
@@ -578,7 +505,6 @@ class PythonBuilder(Builder):
     def _resolve_entry(self) -> str:
         if self.args.script: return os.path.abspath(self.args.script)
         if self.project.entry_point: return os.path.join(self.project_dir, self.project.entry_point)
-        # FIX: Explicit fallback search instead of just glob[0]
         for name in ("main.py", "app.py", "run.py", "start.py", "game.py", "__main__.py"):
             p = os.path.join(self.project_dir, name)
             if os.path.exists(p): return p
@@ -607,16 +533,22 @@ class NodeBuilder(Builder):
 
     def _build_web_app(self) -> str:
         pkg_path = os.path.join(self.project_dir, "package.json")
+        web_root = self.project_dir
         if os.path.exists(pkg_path):
-            if not os.path.exists(os.path.join(self.project_dir, "node_modules")):
-                self._run(["npm", "install"])
-            if "build" in json.load(open(pkg_path)).get("scripts", {}):
+            if not os.path.exists(os.path.join(self.project_dir, "node_modules")): self._run(["npm", "install"])
+            with open(pkg_path, 'r') as f: pkg_data = json.load(f)
+            if "build" in pkg_data.get("scripts", {}):
                 self._run(["npm", "run", "build"])
+                for candidate in ("dist", "build", "out", "public"):
+                    candidate_path = os.path.join(self.project_dir, candidate)
+                    if os.path.exists(os.path.join(candidate_path, "index.html")):
+                        web_root = candidate_path; break
 
         stage_dir = os.path.join(self.dist_dir, "_electron_stage")
         if os.path.exists(stage_dir): shutil.rmtree(stage_dir)
         app_dir = os.path.join(stage_dir, "app")
-        shutil.copytree(self.project_dir, app_dir, ignore=shutil.ignore_patterns("node_modules", ".git"))
+        # FIX: Added dist, build, out to ignore_patterns to prevent recursive copy crash
+        shutil.copytree(web_root, app_dir, ignore=shutil.ignore_patterns("node_modules", ".git", "dist", "build", "out"))
 
         with open(os.path.join(app_dir, "main.js"), 'w') as f:
             f.write(f"const {{ app, BrowserWindow }} = require('electron'); app.whenReady().then(() => {{ new BrowserWindow({{width:1280,height:800}}).loadFile('index.html'); }});")
@@ -635,17 +567,15 @@ class NodeBuilder(Builder):
 
     def _build_electron(self) -> str:
         pkg_path = os.path.join(self.project_dir, "package.json")
-        pkg = json.load(open(pkg_path))
+        with open(pkg_path, 'r') as f: pkg = json.load(f)
         
-        # FIX: Always generate a config to force output directory to self.dist_dir
         config = pkg.get("build", {})
-        config["directories"] = {"output": self.dist_dir}
+        # FIX: Merge directories instead of overwriting, preserving buildResources
+        config["directories"] = {**(config.get("directories", {})), "output": self.dist_dir}
         config_path = os.path.join(self.dist_dir, "electron-builder-config.json")
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=2)
+        with open(config_path, 'w') as f: json.dump(config, f, indent=2)
 
-        if not os.path.exists(os.path.join(self.project_dir, "node_modules")):
-            self._run(["npm", "install"])
+        if not os.path.exists(os.path.join(self.project_dir, "node_modules")): self._run(["npm", "install"])
 
         self._clean_dist_artifacts(".exe")
         cmd = ["npx", "--yes", "electron-builder", "--win", "--x64", "--publish", "never", "--config", config_path]
@@ -678,7 +608,6 @@ class CppBuilder(Builder):
             ext = exe_ext(self.target_os)
             out = os.path.join(self.dist_dir, f"{self.name}{ext}")
             cmd = [compiler, "-O2", "-o", out, os.path.join(self.project_dir, entry)]
-            # FIX: Restrict globbing to specific extensions to prevent compiling .cache or .class
             for pattern in ["*.c", "*.cpp", "*.cc", "*.cxx"]:
                 for f in glob.glob(os.path.join(self.project_dir, pattern)):
                     if os.path.basename(f) != os.path.basename(entry): cmd.append(f)
@@ -746,14 +675,12 @@ class RustBuilder(Builder):
         exe_name = f"{crate_name}{ext}"
         target_dir = os.path.join(self.project_dir, "target", target, "release", exe_name) if target else os.path.join(self.project_dir, "target", "release", exe_name)
         
-        # FIX: Fallback to recursive search if the expected name doesn't exist (e.g. workspaces, multi-bin)
         if not os.path.exists(target_dir):
             search_dir = os.path.join(self.project_dir, "target", target, "release") if target else os.path.join(self.project_dir, "target", "release")
             for root, _, files in os.walk(search_dir):
                 for f in files:
                     if f.lower().endswith(ext) and not f.startswith("lib") and not f.startswith("deps"):
-                        target_dir = os.path.join(root, f)
-                        break
+                        target_dir = os.path.join(root, f); break
         
         dest = os.path.join(self.dist_dir, f"{self.name}{ext}")
         if os.path.exists(target_dir):
@@ -798,11 +725,12 @@ class JavaBuilder(Builder):
         classes = os.path.join(self.dist_dir, "classes")
         os.makedirs(classes, exist_ok=True)
         
-        # FIX: Use @argfile to avoid command line length limits
-        argfile = os.path.join(self.dist_dir, "java_sources.txt")
-        with open(argfile, 'w') as f:
-            for jf in java_files: f.write(jf.replace('\\', '/') + "\n")
+        # FIX: Use tempfile for argfile and quote paths to prevent space crashes
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            argfile = f.name
+            for jf in java_files: f.write(f'"{jf}"\n')
         result = self._run(["javac", "-d", classes, f"@{argfile}"])
+        os.remove(argfile)
         if result.returncode != 0: error("Java compilation failed")
         
         main_class = self._find_main_class(java_files)
@@ -858,11 +786,12 @@ class AndroidBuilder(Builder):
         if not os.path.exists(wrapper):
             if self.deps.is_installed('gradle'): wrapper = "gradle"
             else: error("No Gradle wrapper found.")
-        if sys.platform != "win32" and os.path.exists(wrapper): os.chmod(wrapper, 0o755)
+        # FIX: Explicitly check wrapper != "gradle" to avoid chmodding global binary
+        if wrapper != "gradle" and sys.platform != "win32" and os.path.exists(wrapper):
+            os.chmod(wrapper, 0o755)
         
         self._clean_dist_artifacts(".apk")
         
-        # FIX: Clean up fallback logic to avoid false success on missing APK
         for task in ["assembleRelease", "assembleDebug"]:
             log(f"Running Gradle {task}...")
             result = self._run([wrapper, task, "--no-daemon"])
@@ -873,15 +802,11 @@ class AndroidBuilder(Builder):
                     shutil.copy2(apk, dest)
                     return self._print_result(dest) or dest
                 else:
-                    if task == "assembleRelease":
-                        warn("Release build succeeded but APK not found, trying debug...")
-                    else:
-                        error("Gradle build succeeded but produced no APK")
+                    if task == "assembleRelease": warn("Release build succeeded but APK not found, trying debug...")
+                    else: error("Gradle build succeeded but produced no APK")
             else:
-                if task == "assembleRelease":
-                    warn("Release build failed, trying debug...")
-                else:
-                    error("Gradle build failed — check Android SDK / Gradle setup")
+                if task == "assembleRelease": warn("Release build failed, trying debug...")
+                else: error("Gradle build failed — check Android SDK / Gradle setup")
         error("No APK found in build output")
 
     def _find_apk(self) -> Optional[str]:
@@ -891,7 +816,6 @@ class AndroidBuilder(Builder):
                 for root, _, files in os.walk(search_dir):
                     for f in files:
                         if f.endswith(".apk"): return os.path.join(root, f)
-        # FIX: Exclude dist_dir from fallback to prevent finding old artifacts
         for root, dirs, files in os.walk(self.project_dir):
             dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and os.path.join(root, d) != self.dist_dir]
             for f in files:
@@ -921,7 +845,13 @@ class FlutterBuilder(Builder):
         result = self._run(["flutter", "build", build_target, "--release"])
         if result.returncode != 0: error(f"Flutter {build_target} build failed")
         ext = exe_ext(self.target_os)
-        build_dirs = [os.path.join(self.project_dir, "build", build_target, "x64", "runner", "Release"), os.path.join(self.project_dir, "build", build_target, "runner", "Release")]
+        # FIX: Added Linux "bundle" directory to search paths
+        build_dirs = [
+            os.path.join(self.project_dir, "build", build_target, "x64", "runner", "Release"),
+            os.path.join(self.project_dir, "build", build_target, "runner", "Release"),
+            os.path.join(self.project_dir, "build", build_target, "x64", "release", "bundle"), # Linux
+            os.path.join(self.project_dir, "build", build_target, "x64", "bundle")
+        ]
         for d in build_dirs:
             if os.path.exists(d):
                 for f in os.listdir(d):

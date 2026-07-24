@@ -2,50 +2,6 @@
 """
 PolyBuild Pro v2.3.3 - Universal App & Game Builder (EXE / APK / Native)
 Auto-detects 25+ languages, self-updates, auto-manages & installs dependencies.
-
-FIXES (v2.3.3) — found on this pass:
-  - CSharpBuilder picked "osx-x64" for a plain native build on Windows,
-    because it only checked target_os == "windows" (never true for the
-    default "native") and then fell straight to the darwin/else branches.
-    Native win32 / native darwin / linux are now all handled explicitly.
-  - RustBuilder._get_crate_name() replaced '-' with '_' in the returned
-    name, but Cargo only does that for the *library* identifier — the
-    actual binary on disk keeps the hyphenated package name. Any crate
-    named e.g. "my-cool-app" would never be found. Also fixed the
-    fallback search: the old code's `break` only exited the inner
-    `for f in files` loop, so os.walk kept descending into deps/ and
-    incremental/ and could overwrite target_dir with the wrong file.
-  - NodeBuilder._build_node used raw `sys.platform` as the pkg target
-    suffix (`node18-{sys.platform}-x64`). On macOS sys.platform is
-    "darwin", not "macos" — pkg doesn't recognize "node18-darwin-x64".
-    Restored explicit win/macos/linux branching.
-  - ProjectDetector.detect(): Kotlin, Scala, Ruby, Crystal, and Perl
-    detection blocks were missing entirely from this rewrite even
-    though JavaBuilder/RubyBuilder/CrystalBuilder still exist and are
-    wired up in BUILDERS — those project types could only ever be
-    forced via --lang, never auto-detected. Restored.
-  - Python and C/C++ candidates were only appended to `candidates` when
-    a count of matching files was > 0 — but the score itself (e.g. from
-    requirements.txt or CMakeLists.txt alone, no .py/.cpp files
-    scanned) could still be positive, meaning some valid projects
-    silently produced UNKNOWN. Un-nested the append.
-  - AndroidBuilder._find_apk()'s recursive fallback search reused the
-    global EXCLUDED_DIRS set, which (in this revision) added 'build'
-    and 'dist' to the exclusion list. Since Gradle/Flutter APK output
-    always lives under a directory literally named "build", this made
-    the "search whole project" fallback structurally unable to find
-    anything — defeating its entire purpose. Given its own minimal
-    exclusion set instead.
-  - SelfUpdater._perform_update() dropped the py_compile validation +
-    automatic rollback-to-backup that guarded against a downloaded
-    update that parses as valid Python (passes ast.parse) but still
-    fails to byte-compile/import. Restored.
-  - CppBuilder silently dropped Makefile-based build support (only
-    CMake or a naive single-shot gcc/g++ compile remained) — a
-    Makefile-only C/C++ project would now be compiled incorrectly
-    with a hand-rolled command instead of running `make`. Restored.
-  - A few unclosed file handles (`open(...).read()` without `with`)
-    cleaned up.
 """
 
 import os

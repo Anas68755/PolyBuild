@@ -1,4 +1,52 @@
 #!/usr/bin/env python3
+"""
+PolyBuild Pro v2.3.3 - Universal App & Game Builder (EXE / APK / Native)
+Auto-detects 25+ languages, self-updates, auto-manages & installs dependencies.
+
+FIXES (v2.3.3) — found on this pass:
+  - CSharpBuilder picked "osx-x64" for a plain native build on Windows,
+    because it only checked target_os == "windows" (never true for the
+    default "native") and then fell straight to the darwin/else branches.
+    Native win32 / native darwin / linux are now all handled explicitly.
+  - RustBuilder._get_crate_name() replaced '-' with '_' in the returned
+    name, but Cargo only does that for the *library* identifier — the
+    actual binary on disk keeps the hyphenated package name. Any crate
+    named e.g. "my-cool-app" would never be found. Also fixed the
+    fallback search: the old code's `break` only exited the inner
+    `for f in files` loop, so os.walk kept descending into deps/ and
+    incremental/ and could overwrite target_dir with the wrong file.
+  - NodeBuilder._build_node used raw `sys.platform` as the pkg target
+    suffix (`node18-{sys.platform}-x64`). On macOS sys.platform is
+    "darwin", not "macos" — pkg doesn't recognize "node18-darwin-x64".
+    Restored explicit win/macos/linux branching.
+  - ProjectDetector.detect(): Kotlin, Scala, Ruby, Crystal, and Perl
+    detection blocks were missing entirely from this rewrite even
+    though JavaBuilder/RubyBuilder/CrystalBuilder still exist and are
+    wired up in BUILDERS — those project types could only ever be
+    forced via --lang, never auto-detected. Restored.
+  - Python and C/C++ candidates were only appended to `candidates` when
+    a count of matching files was > 0 — but the score itself (e.g. from
+    requirements.txt or CMakeLists.txt alone, no .py/.cpp files
+    scanned) could still be positive, meaning some valid projects
+    silently produced UNKNOWN. Un-nested the append.
+  - AndroidBuilder._find_apk()'s recursive fallback search reused the
+    global EXCLUDED_DIRS set, which (in this revision) added 'build'
+    and 'dist' to the exclusion list. Since Gradle/Flutter APK output
+    always lives under a directory literally named "build", this made
+    the "search whole project" fallback structurally unable to find
+    anything — defeating its entire purpose. Given its own minimal
+    exclusion set instead.
+  - SelfUpdater._perform_update() dropped the py_compile validation +
+    automatic rollback-to-backup that guarded against a downloaded
+    update that parses as valid Python (passes ast.parse) but still
+    fails to byte-compile/import. Restored.
+  - CppBuilder silently dropped Makefile-based build support (only
+    CMake or a naive single-shot gcc/g++ compile remained) — a
+    Makefile-only C/C++ project would now be compiled incorrectly
+    with a hand-rolled command instead of running `make`. Restored.
+  - A few unclosed file handles (`open(...).read()` without `with`)
+    cleaned up.
+"""
 
 import os
 import sys
@@ -298,6 +346,56 @@ class DependencyManager:
                 return False
             return False
         except Exception: return False
+
+    # FIX (v2.3.3): --update-deps was declared as a CLI flag but nothing ever
+    # called this — restored so the flag isn't a silent no-op.
+    def update_project_deps(self, project_dir: str, lang: 'LangType'):
+        log("Updating project dependencies...")
+        try:
+            if lang == LangType.PYTHON:
+                req = os.path.join(project_dir, "requirements.txt")
+                if os.path.exists(req):
+                    subprocess.run([sys.executable, "-m", "pip", "install", "-U", "-r", req], capture_output=True)
+                    success("Updated Python requirements")
+                if os.path.exists(os.path.join(project_dir, "Pipfile")) and self.is_installed('pipenv'):
+                    subprocess.run(["pipenv", "update"], cwd=project_dir, capture_output=True)
+                    success("Updated Pipfile dependencies")
+            elif lang in (LangType.NODE, LangType.ELECTRON):
+                if os.path.exists(os.path.join(project_dir, "package.json")):
+                    if os.path.exists(os.path.join(project_dir, "yarn.lock")):
+                        subprocess.run(["yarn", "upgrade"], cwd=project_dir, capture_output=True)
+                        success("Updated Yarn dependencies")
+                    else:
+                        subprocess.run(["npm", "update"], cwd=project_dir, capture_output=True)
+                        success("Updated npm dependencies")
+            elif lang == LangType.RUST:
+                if os.path.exists(os.path.join(project_dir, "Cargo.toml")):
+                    subprocess.run(["cargo", "update"], cwd=project_dir, capture_output=True)
+                    success("Updated Cargo dependencies")
+            elif lang == LangType.GO:
+                if os.path.exists(os.path.join(project_dir, "go.mod")):
+                    subprocess.run(["go", "get", "-u", "./..."], cwd=project_dir, capture_output=True)
+                    subprocess.run(["go", "mod", "tidy"], cwd=project_dir, capture_output=True)
+                    success("Updated Go modules")
+            elif lang in (LangType.JAVA, LangType.KOTLIN, LangType.SCALA):
+                if os.path.exists(os.path.join(project_dir, "pom.xml")) and self.is_installed('mvn'):
+                    subprocess.run(["mvn", "versions:use-latest-versions"], cwd=project_dir, capture_output=True)
+                    success("Updated Maven dependencies")
+                elif os.path.exists(os.path.join(project_dir, "build.gradle")) and self.is_installed('gradle'):
+                    subprocess.run(["gradle", "dependencies", "--refresh-dependencies"], cwd=project_dir, capture_output=True)
+                    success("Refreshed Gradle dependencies")
+            elif lang == LangType.CSHARP:
+                if self.is_installed('dotnet'):
+                    subprocess.run(["dotnet", "restore", "--force-evaluate"], cwd=project_dir, capture_output=True)
+                    success("Restored .NET dependencies")
+            elif lang in (LangType.FLUTTER, LangType.DART):
+                if os.path.exists(os.path.join(project_dir, "pubspec.yaml")):
+                    subprocess.run(["flutter", "pub", "upgrade"], cwd=project_dir, capture_output=True)
+                    success("Updated Flutter dependencies")
+            else:
+                dim(f"No dependency-update rule for {lang.name}; skipping.")
+        except Exception as e:
+            warn(f"Dependency update failed: {e}")
 
 
 # ==================== PROJECT DETECTION ====================
@@ -1173,6 +1271,10 @@ def main():
     if detected.lang == LangType.UNKNOWN: error("Could not detect project type. Use --lang to force.")
 
     deps = DependencyManager()
+
+    if args.update_deps:
+        deps.update_project_deps(project_dir, detected.lang)
+
     builder_class = BUILDERS.get(detected.lang)
 
     if args.target_os == "android":

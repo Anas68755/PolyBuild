@@ -1,6 +1,6 @@
-# PolyBuild Pro v2.2
+# PolyBuild Pro v2.3.3
 
-> **Universal App & Game EXE Builder** — Auto-detects 20+ programming languages and game engines, self-updates, and auto-manages dependencies.
+> **Universal App & Game Builder** — Auto-detects 20+ programming languages and game engines, installs missing build tools, and packages your project into a distributable binary.
 
 ---
 
@@ -12,7 +12,6 @@
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Command-Line Reference](#command-line-reference)
-- [Configuration File](#configuration-file)
 - [Language-Specific Guides](#language-specific-guides)
 - [Game Engine Workflows](#game-engine-workflows)
 - [Self-Updating](#self-updating)
@@ -26,14 +25,15 @@
 
 ## Overview
 
-PolyBuild Pro eliminates the friction of building distributable Windows executables from source code. Drop it into any project folder and it will:
+PolyBuild Pro eliminates the friction of building distributable executables from source code. Drop it into any project folder and it will:
 
 1. **Auto-detect** the programming language, framework, or game engine
 2. **Check & install** missing build toolchains automatically
-3. **Update** project dependencies to their latest compatible versions
-4. **Compile & package** everything into a polished, windowed `.exe`
+3. **Compile & package** everything into a ready-to-run binary
 
-No manual configuration required for most projects.
+By default it builds a **native binary for whatever OS you run it on** — Linux produces a Linux binary, macOS produces a macOS binary, Windows produces a `.exe`. Pass `--target-os windows` to cross-compile a Windows `.exe` from Linux/macOS, or `--target-os android` to package an Android APK.
+
+No manual configuration is required for most projects — just run it in your project root.
 
 ---
 
@@ -43,12 +43,13 @@ No manual configuration required for most projects.
 |---------|-------------|
 | **🔍 Auto-Detection** | Scans project files and scores confidence for 20+ language/ecosystem types |
 | **🛠️ Auto-Installation** | Missing compiler? PolyBuild installs it via `pip`, `npm`, Chocolatey/winget (Windows), Homebrew (macOS), or apt-get (Linux) |
-| **🌐 Web App Bundling** | Plain `index.html` sites and bundler-based apps (Vite/CRA/webpack) are auto-wrapped in a generated Electron shell and compiled to `.exe` |
-| **🔄 Self-Updating** | Checks for new versions on startup; one-flag self-patch (`--update`) |
+| **🌐 Web App Bundling** | Plain `index.html` sites and bundler-based apps (Vite/CRA/webpack) are auto-wrapped in a generated Electron shell and compiled |
+| **🎯 Multi-Target Output** | Native binary (default), Windows `.exe` cross-compile, or Android `.apk` — controlled by `--target-os` |
+| **🔄 Self-Updating** | One-flag self-patch (`--update`) once update URLs are configured |
 | **📦 Dependency Sync** | Updates `requirements.txt`, `Cargo.toml`, `package.json`, `go.mod`, etc. before building |
-| **🎮 Game Engines** | Native export support for Godot, LÖVE2D; detection for Unity, Unreal, GameMaker, Ren'Py |
-| **🪟 Windowed Output** | Automatically applies `-H=windowsgui`, `--windows-disable-console`, or equivalent flags |
-| **📁 One-File Mode** | Single portable `.exe` via `--onefile` (where the toolchain supports it) |
+| **🎮 Game Engines** | Native export support for Godot and LÖVE2D; project detection for Unity and Unreal |
+| **🪟 Windowed Output** | Applies `-H=windowsgui`, `--windows-disable-console`, or equivalent flags when targeting Windows |
+| **📁 One-File Mode** | Single portable executable via `--onefile`, where the toolchain supports it |
 | **⚡ Smart Backends** | Python projects automatically choose between PyInstaller (compatibility) and Nuitka (speed) |
 
 ---
@@ -57,38 +58,35 @@ No manual configuration required for most projects.
 
 ### General-Purpose Languages
 
-| Language | Build Tool | One-File | Icon | Notes |
-|----------|-----------|----------|------|-------|
-| **Python** | PyInstaller / Nuitka | ✅ | ✅ | Auto-detects tkinter, PyGame, PyQt |
-| **Node.js (CLI script)** | `pkg` | ✅ | ❌ | Bundles Node runtime; needs a `.js`/`.ts` entry point |
-| **Web App (`index.html`)** | Auto-generated Electron wrapper → `electron-builder` | ✅ | ✅ | Runs `npm run build` first if a build script exists, then wraps the compiled site (or a plain static site) in a minimal Electron shell |
-| **Electron** | `electron-builder` | ✅ | ✅ | Portable or NSIS installer |
-| **C** | GCC / Clang / CMake | ⚠️ | ❌ | Static linking supported |
-| **C++** | CMake → Make / MSVC | ⚠️ | ❌ | vcpkg integration |
-| **C#** | `dotnet publish` | ✅ | ✅ | Self-contained, trimmed |
-| **Go** | `go build` | ✅ | ❌ | Native `-H=windowsgui` |
-| **Rust** | `cargo build --release` | ⚠️ | ❌ | Static CRT linking |
-| **Java** | `jpackage` / Maven / Gradle | ✅ | ✅ | Native image via `jpackage` |
-| **Kotlin** | Gradle / Maven | ✅ | ✅ | JVM ecosystem |
-| **Scala** | SBT / Gradle / Maven | ✅ | ✅ | JVM ecosystem |
-| **Flutter / Dart** | `flutter build windows` | ❌ | ✅ | Includes required DLLs |
-| **Lua** | LÖVE2D bundling | ✅ | ❌ | Concatenates `love.exe` + `.love` |
-| **Nim** | `nim c` | ✅ | ❌ | `--app:gui` for windowed |
-| **Zig** | `zig build-exe` | ✅ | ❌ | Cross-compilation ready |
-| **Crystal** | `crystal build` | ✅ | ❌ | `--release --no-debug` |
-| **Ruby** | OCRA gem | ✅ | ❌ | Auto-installs OCRA |
-| **Perl** | Detection only | — | — | Manual build guidance |
+| Language | Build Tool | One-File | Notes |
+|----------|-----------|----------|-------|
+| **Python** | PyInstaller / Nuitka | ✅ | Icon support via `--icon` |
+| **Node.js (CLI script)** | `pkg` | ✅ | Bundles the Node runtime; needs a `.js`/`.ts` entry point |
+| **Web App (`index.html`)** | Auto-generated Electron wrapper → `electron-builder` | ✅ | Runs `npm run build` first if a build script exists |
+| **Electron** | `electron-builder` | ✅ | Portable or NSIS installer; supports `--devtools` for debugging |
+| **C / C++** | CMake → Make → direct GCC/Clang | ⚠️ | Tries each build system in that priority order |
+| **C#** | `dotnet publish` | ✅ | Self-contained runtime; single-file with `--onefile` |
+| **Go** | `go build` | ✅ | Sets `-H=windowsgui` automatically when targeting Windows |
+| **Rust** | `cargo build --release` | ⚠️ | Cross-compiling requires the Rust target already installed |
+| **Java** | `jpackage` / Gradle / Maven | ✅ | `jpackage` used only with `--onefile`; falls back to a plain JAR otherwise |
+| **Kotlin** | Gradle (JVM toolchain) | ✅ | Auto-detected from `.kt`/`.kts` files |
+| **Scala** | SBT / Gradle / Maven | ✅ | Auto-detected from `.scala` files |
+| **Flutter / Dart** | `flutter build <platform>` or `flutter build apk` | ❌ | Desktop or Android output depending on `--target-os` |
+| **Lua** | LÖVE2D bundling | ✅ | Concatenates the `love` executable with a zipped `.love` archive |
+| **Nim** | `nim c` | ✅ | `--app:gui` applied for windowed output |
+| **Zig** | `zig build` / `zig build-exe` | ✅ | Uses `-Doptimize=ReleaseFast` |
+| **Crystal** | `crystal build` | ✅ | `--release --no-debug` |
+| **Ruby** | OCRA gem | ✅ | Auto-installs OCRA |
+| **Android (Java/Kotlin)** | Gradle `assembleRelease` (falls back to `assembleDebug`) | — | Requires `--target-os android` |
 
 ### Game Engines
 
 | Engine | Detection | Export Strategy |
 |--------|-----------|-----------------|
-| **Godot** | `project.godot`, `.tscn` | `godot --export-release "Windows Desktop"` |
-| **Unity** | `Assets/`, `.unity`, `Packages/manifest.json` | Project detection + build guidance |
-| **Unreal Engine** | `.uproject`, `Source/`, `Content/` | Project detection + build guidance |
-| **GameMaker** | `.yyp`, `.gml` | Project detection |
-| **Ren'Py** | `script.rpy`, `options.rpy` | Visual novel detection |
-| **LÖVE2D** | `main.lua`, `conf.lua` | Zips game → appends to `love.exe` |
+| **Godot** | `project.godot` | Headless export of the first preset found in `export_presets.cfg` |
+| **Unity** | `Assets/` + `ProjectSettings/` directories | Project detection |
+| **Unreal Engine** | `.uproject` | Project detection |
+| **LÖVE2D** | `main.lua` | Zips the game and appends it to the `love` executable |
 
 ---
 
@@ -96,50 +94,43 @@ No manual configuration required for most projects.
 
 ### Prerequisites
 
-- **Windows 10/11** (primary target — output is always a Windows `.exe`, even when building from Linux/macOS via cross-compilation)
 - **Python 3.8+** (to run PolyBuild itself)
 - **Internet connection** (for auto-installation of missing tools)
 - A package manager PolyBuild can use to auto-install missing toolchains:
-  - Windows: **winget** or **Chocolatey** (PolyBuild will install Chocolatey itself if neither is present)
+  - Windows: **winget** or **Chocolatey**
   - macOS: **Homebrew**
   - Linux: **apt-get** (Debian/Ubuntu-based distros)
 
   On other platforms/distros, PolyBuild will tell you what to install manually and where to get it.
 
+- To cross-compile to Windows from Linux/macOS (`--target-os windows`), the relevant cross toolchain must be present for your language (e.g. `mingw-w64` for Go/C/C++, or the `x86_64-pc-windows-gnu` Rust target added via `rustup target add`).
+- To build Android APKs (`--target-os android`), a Gradle wrapper (`gradlew`) should exist in the project, or Gradle must be installed and on `PATH`.
+
 ### Setup
 
-1. Download `polybuild.py` to your project or a folder in your `PATH`:
-   ```powershell
-   # Using curl
+1. Download `polybuild.py` to your project or a folder on your `PATH`:
+   ```bash
    curl -O https://raw.githubusercontent.com/polybuild/polybuild/main/polybuild.py
-
-   # Or place it in a global tools folder
-   mkdir C:\Tools
-   move polybuild.py C:\Tools
-   setx PATH "%PATH%;C:\Tools"
    ```
 
-2. (Optional) Create a shorthand alias:
-   ```powershell
-   # PowerShell profile
-   function polybuild { python C:\Tools\polybuild.py @args }
+2. (Optional) Create a shorthand alias, e.g. in your shell profile:
+   ```bash
+   alias polybuild="python3 /path/to/polybuild.py"
    ```
 
 ---
 
 ## Quick Start
 
-### 1. Basic Auto-Build
-
-Navigate to any project folder and run:
+### 1. Basic Auto-Build (native output)
 
 ```bash
 python polybuild.py
 ```
 
-PolyBuild will detect the language, install missing tools, and output `dist\ProjectName.exe`.
+PolyBuild detects the language, installs missing tools, and outputs `dist/ProjectName` (or `dist/ProjectName.exe` on Windows).
 
-### 2. Build with Custom Name & Icon
+### 2. Build with a Custom Name & Icon
 
 ```bash
 python polybuild.py --name MyAwesomeApp --icon assets/icon.ico --onefile
@@ -151,19 +142,23 @@ python polybuild.py --name MyAwesomeApp --icon assets/icon.ico --onefile
 python polybuild.py --lang rust --name server
 ```
 
-### 4. Update Dependencies Before Building
+### 4. Cross-Compile to Windows from Linux/macOS
+
+```bash
+python polybuild.py --target-os windows --name MyApp
+```
+
+### 5. Build an Android APK
+
+```bash
+python polybuild.py --target-os android
+```
+
+### 6. Update Project Dependencies Before Building
 
 ```bash
 python polybuild.py --update-deps --onefile
 ```
-
-### 5. Initialize a Config File
-
-```bash
-python polybuild.py --init
-```
-
-This creates `polybuild.json` in the current directory for reproducible builds.
 
 ---
 
@@ -175,22 +170,20 @@ This creates `polybuild.json` in the current directory for reproducible builds.
 |------|-------|-------------|---------|
 | `--project` | `-p` | Path to project directory | `.` (current) |
 | `--script` | `-s` | Override entry-point file | Auto-detected |
-| `--name` | `-n` | Output EXE name | Folder name |
+| `--name` | `-n` | Output binary name | Folder name |
 | `--icon` | `-i` | Path to `.ico` file | None |
 | `--output` | `-o` | Output directory | `dist` |
 | `--lang` | — | Force language detection | Auto-detect |
+| `--target-os` | — | `native`, `windows`, or `android` | `native` |
 
 ### Build Options
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--onefile` | `-f` | Package everything into a single `.exe` |
-| `--console` | `-c` | Keep the console window (disable `--windowed`) |
-| `--backend` | — | Python backend: `auto`, `pyinstaller`, `nuitka` | `auto` |
-| `--auto-detect` | — | Auto-detect hidden imports & data files | Enabled |
-| `--no-auto-detect` | — | Disable auto-detection |
-| `--hidden-imports` | — | Add hidden imports (repeatable) |
-| `--add-data` | — | Add data files `src;dst` (repeatable) |
+| `--onefile` | `-f` | Package everything into a single executable, where supported |
+| `--console` | `-c` | Keep the console window (disable windowed mode) |
+| `--devtools` | — | Open DevTools automatically in generated Electron web-app wrappers |
+| `--backend` | — | Python backend: `auto` (default), `pyinstaller`, or `nuitka` |
 
 ### Maintenance Flags
 
@@ -198,38 +191,8 @@ This creates `polybuild.json` in the current directory for reproducible builds.
 |------|-------------|
 | `--update` | Update PolyBuild itself to the latest version |
 | `--update-deps` | Update project dependencies before building |
-| `--check-tools` | Display install status of all known build tools |
-| `--init` | Create a `polybuild.json` template |
-| `--verbose` / `-v` | Show full compiler output |
-
----
-
-## Configuration File
-
-When you run `polybuild.py --init`, the following `polybuild.json` is generated:
-
-```json
-{
-  "version": "2.2.0",
-  "project_dir": ".",
-  "name": "MyApp",
-  "icon": "assets/icon.ico",
-  "onefile": true,
-  "console": false,
-  "backend": "auto",
-  "auto_detect": true,
-  "update_deps": true
-}
-```
-
-### Loading Config
-
-PolyBuild automatically reads `polybuild.json` if it exists. You can also chain overrides:
-
-```bash
-# Uses polybuild.json but overrides the name
-python polybuild.py --name OverrideName
-```
+| `--check-tools` | Print install status of every build tool PolyBuild knows about |
+| `--verbose` / `-v` | Show full compiler/tool output instead of suppressing it |
 
 ---
 
@@ -240,12 +203,8 @@ python polybuild.py --name OverrideName
 **Best for:** GUI apps, PyGame titles, data tools, utilities
 
 **Backends:**
-- **PyInstaller** (default): Maximum compatibility, bundles everything
-- **Nuitka** (`--backend nuitka`): Compiles Python to C first — faster runtime, smaller in some cases
-
-**Auto-Detection:**
-- Hidden imports for `sklearn`, `pandas`, `numpy`, `PIL`, `matplotlib`, `cryptography`, `pygame`
-- Data folders: `assets/`, `resources/`, `data/`, `templates/`, `images/`, `sounds/`, `fonts/`
+- **PyInstaller** (default): maximum compatibility, bundles everything
+- **Nuitka** (`--backend nuitka`, also chosen automatically when it's installed and `--onefile` isn't set): compiles Python to C first, for faster startup
 
 ```bash
 python polybuild.py --backend nuitka --onefile --icon app.ico
@@ -257,9 +216,9 @@ python polybuild.py --backend nuitka --onefile --icon app.ico
 
 PolyBuild picks one of three paths depending on what it finds:
 
-- **Node.js CLI script** (entry point is a `.js`/`.ts` file, e.g. `index.js`) → bundled into a single executable with `pkg`.
-- **Web app** (entry point is `index.html`, with or without a `package.json`) → if a `build` script exists in `package.json` (Vite/CRA/webpack/etc.), PolyBuild runs `npm run build` and picks up the compiled output from `dist/`, `build/`, `out/`, or `public/`. Either way, the resulting static site is staged inside an auto-generated, minimal Electron shell and packaged with `electron-builder`. This also works for plain static sites with no `package.json` at all.
-- **Electron app** (project already declares `electron` as a dependency) → built directly with `electron-builder`, using your existing `package.json` `build` config if present, or a sensible default otherwise.
+- **Node.js CLI script** (entry point is a `.js`/`.ts` file) → bundled with `pkg`.
+- **Web app** (entry point is `index.html`) → if a `build` script exists in `package.json`, PolyBuild runs `npm run build` and picks up the compiled output from `dist/`, `build/`, `out/`, or `public/`; either way the static site is staged inside an auto-generated Electron shell and packaged with `electron-builder`.
+- **Electron app** (project already declares `electron` as a dependency) → built directly with `electron-builder`, using your existing `package.json` `build` config where present.
 
 ```bash
 # Node.js CLI script
@@ -268,8 +227,8 @@ python polybuild.py --lang node
 # Plain index.html site or a Vite/CRA/webpack app
 python polybuild.py --name MySite --icon assets/icon.ico
 
-# Already-configured Electron app
-python polybuild.py --lang electron --onefile
+# Already-configured Electron app, with DevTools open for debugging
+python polybuild.py --lang electron --onefile --devtools
 ```
 
 ### C / C++
@@ -279,7 +238,7 @@ python polybuild.py --lang electron --onefile
 Build priority:
 1. **CMake** (if `CMakeLists.txt` exists)
 2. **Make** (if `Makefile` exists)
-3. **Direct GCC** (fallback)
+3. **Direct GCC/Clang** (fallback for a flat single-directory project)
 
 ```bash
 python polybuild.py --lang cpp
@@ -287,61 +246,58 @@ python polybuild.py --lang cpp
 
 ### C# / .NET
 
-**Best for:** Windows desktop apps, Unity-adjacent tools
+**Best for:** Windows desktop apps, cross-platform CLI tools
 
-Uses `dotnet publish` with:
-- Self-contained runtime
-- Single-file publishing (`--onefile`)
-- Assembly trimming for smaller size
+Uses `dotnet publish` with a self-contained runtime, and single-file publishing when `--onefile` is passed. The runtime identifier is chosen automatically based on your OS and `--target-os`.
 
 ```bash
-python polybuild.py --lang csharp --onefile --name MyWinApp
+python polybuild.py --lang csharp --onefile --name MyApp
 ```
 
 ### Go
 
 **Best for:** Microservices, CLI tools, lightweight servers
 
-Automatically sets:
-- `GOOS=windows`
-- `GOARCH=amd64`
-- `-H=windowsgui` (unless `--console`)
+Automatically sets `GOOS=windows`, `GOARCH=amd64`, and `-H=windowsgui` when targeting Windows (unless `--console` is passed).
 
 ```bash
-python polybuild.py --lang go --onefile
+python polybuild.py --lang go --onefile --target-os windows
 ```
 
 ### Rust
 
 **Best for:** Systems programming, game engines, high-performance apps
 
-Auto-detects target triple and installs missing cross-compile targets via `rustup`.
-
 ```bash
 python polybuild.py --lang rust
 ```
 
-### Java
-
-**Best for:** Enterprise apps, Android tooling, cross-platform utilities
-
-Priority:
-1. `jpackage` (JDK 14+, creates native `.exe`)
-2. Gradle (`build.gradle`)
-3. Maven (`pom.xml`)
+Cross-compiling to Windows from Linux/macOS requires the `x86_64-pc-windows-gnu` target:
 
 ```bash
-python polybuild.py --lang java --onefile
+rustup target add x86_64-pc-windows-gnu
+```
+
+### Java / Kotlin / Scala
+
+**Best for:** Enterprise apps, JVM-ecosystem tools
+
+Build priority: `jpackage` (only with `--onefile`) → Gradle (`build.gradle`) → Maven (`pom.xml`) → plain `javac` + `jar` fallback.
+
+```bash
+python polybuild.py --lang kotlin --onefile
 ```
 
 ### Flutter
 
 **Best for:** Cross-platform mobile/desktop apps
 
-Runs `flutter build windows` and copies the Release bundle plus required DLLs to `dist/`.
-
 ```bash
+# Desktop build (native OS)
 python polybuild.py --lang flutter --name MyFlutterApp
+
+# Android APK
+python polybuild.py --lang flutter --target-os android
 ```
 
 ---
@@ -350,40 +306,41 @@ python polybuild.py --lang flutter --name MyFlutterApp
 
 ### Godot
 
-PolyBuild detects `project.godot` and runs headless export:
+PolyBuild detects `project.godot` and runs a headless export using the first preset found in `export_presets.cfg`:
 
 ```bash
 python polybuild.py -p ./my-godot-game --name SpaceShooter
 ```
 
-**Prerequisite:** Export templates must be installed in Godot.
+**Prerequisites:**
+- Export templates must be installed in Godot (**Editor → Manage Export Templates**).
+- At least one export preset must be configured (**Project → Export**). If you have multiple presets, make sure the one you want built is listed first.
 
 ### LÖVE2D
 
 For LÖVE2D games, PolyBuild:
 1. Zips all `.lua`, image, audio, and font files into a `.love` archive
-2. Appends the archive to a copy of `love.exe`
-3. Produces a single runnable `.exe`
+2. Appends the archive to a copy of the `love` executable
+3. Produces a single runnable executable
 
 ```bash
 python polybuild.py -p ./love-game --name Platformer
 ```
 
-### Unity / Unreal / GameMaker / Ren'Py
+### Unity / Unreal
 
-These engines are **detected** and their project structure identified. Because their build pipelines require editor interaction or specific SDK configurations, PolyBuild will:
-
-- Confirm the engine type
-- List detected build files
-- Provide guidance on the correct editor-based export steps
-
-For automated CI/CD with these engines, consider their dedicated CLI tools (e.g., `Unity -batchmode`, `Unreal Build Tool`).
+These engines are **detected** and their project structure identified, but their build pipelines require editor interaction or specific SDK configurations that PolyBuild doesn't automate. For CI/CD with these engines, use their own CLI tools (`Unity -batchmode`, Unreal Build Tool).
 
 ---
 
 ## Self-Updating
 
-PolyBuild checks for updates silently on every run (5-second timeout, no network = no problem).
+Self-update needs two environment variables pointing at where your update manifest and script live:
+
+```bash
+export POLYBUILD_UPDATE_URL="https://example.com/polybuild.py"
+export POLYBUILD_VERSION_URL="https://example.com/version.json"
+```
 
 ### Manual Update
 
@@ -392,22 +349,18 @@ python polybuild.py --update
 ```
 
 **Process:**
-1. Fetches remote version manifest
-2. Compares with local `VERSION`
-3. Downloads new script if newer version exists
-4. Verifies SHA-256 hash (if provided)
-5. Backs up current script to `.backup`
-6. Replaces in-place
-
-### Disable Checks
-
-If you want to skip the update check, use `--check-tools` or work offline.
+1. Fetches the remote version manifest
+2. Compares it with the local version
+3. Downloads the new script if a newer version is available
+4. Verifies the SHA-256 hash, if the manifest provides one
+5. Backs up the current script to `polybuild.py.backup`
+6. Writes the new script in place, then verifies it byte-compiles cleanly — automatically restoring the backup if it doesn't
 
 ---
 
 ## Dependency Management
 
-### What Gets Updated
+### What Gets Updated (via `--update-deps`)
 
 | Ecosystem | Files Scanned | Update Command |
 |-----------|--------------|----------------|
@@ -415,79 +368,67 @@ If you want to skip the update check, use `--check-tools` or work offline.
 | Node.js | `package.json`, `yarn.lock` | `npm update` / `yarn upgrade` |
 | Rust | `Cargo.toml` | `cargo update` |
 | Go | `go.mod` | `go get -u ./...`, `go mod tidy` |
-| Java | `pom.xml`, `build.gradle` | `mvn versions:use-latest-versions`, `gradle --refresh-dependencies` |
+| Java/Kotlin/Scala | `pom.xml`, `build.gradle` | `mvn versions:use-latest-versions`, `gradle --refresh-dependencies` |
 | C# | `.csproj` | `dotnet restore --force-evaluate` |
 | C++ | `vcpkg.json` | `vcpkg upgrade` |
-
-### Usage
+| Flutter | `pubspec.yaml` | `flutter pub upgrade` |
 
 ```bash
-# Update deps AND build
 python polybuild.py --update-deps
-
-# Config-only: always update before building
-# In polybuild.json:
-#   "update_deps": true
 ```
 
 ---
 
 ## Troubleshooting
 
-### "No recognizable project files found"
+### "No recognizable project files found" / "Could not detect project type"
 
 - Verify you are in the project root (where `main.py`, `Cargo.toml`, `package.json`, etc. lives)
-- Use `--lang` to force detection: `python polybuild.py --lang python`
+- Force detection with `--lang`, e.g. `python polybuild.py --lang python`
 
 ### "Tool X not found"
 
 PolyBuild attempts auto-installation via:
-- **pip** (Python packages like PyInstaller, Nuitka, meson)
-- **npm** (Node packages like `pkg`, `electron`, `electron-builder` — installed into the project directory, not globally, unless the tool needs to be global)
-- **winget / Chocolatey** on Windows (system tools like CMake, Go, Rust, Godot, ninja, Maven, Gradle, Kotlin, UPX); PolyBuild installs Chocolatey itself first if neither is present
+- **pip** (Python packages like PyInstaller, Nuitka)
+- **npm** (Node packages like `pkg`, `electron`, `electron-builder`)
+- **winget / Chocolatey** on Windows
 - **Homebrew** on macOS
 - **apt-get** on Linux (Debian/Ubuntu-based)
 
-If auto-install fails:
-1. On Windows, install Chocolatey: https://chocolatey.org/install
-2. On macOS, install Homebrew: https://brew.sh
-3. Or install the tool manually and ensure it's on `PATH` — PolyBuild will print the official download link for the specific tool it couldn't install
+Run `python polybuild.py --check-tools` to see the install status of every tool PolyBuild knows about. If auto-install fails, install the tool manually and make sure it's on `PATH`.
 
 ### PyInstaller builds are too large
 
-- Use `--backend nuitka` for Python (smaller in some cases)
-- Use `--onefile` with UPX compression (if `upx` is installed)
-- Exclude unnecessary modules with `--exclude-module`
+- Try `--backend nuitka`
+- Use `--onefile` with UPX compression, if `upx` is installed
 
 ### "CMake configuration failed"
 
 - Ensure Visual Studio Build Tools or MinGW is installed
-- On Windows, PolyBuild defaults to `Visual Studio 17 2022` generator
-- Override by running CMake manually with `-G` first
+- On Windows, PolyBuild defaults to the `Visual Studio 17 2022` generator
 
 ### Godot export fails
 
-- Install export templates in Godot: **Editor → Manage Export Templates**
-- Ensure the preset name matches `"Windows Desktop"`
+- Install export templates: **Editor → Manage Export Templates**
+- Make sure `export_presets.cfg` has at least one preset defined
 
-### LÖVE2D: "love.exe not found"
+### "love executable not found"
 
 - Install LÖVE2D: https://love2d.org/
-- Ensure `love.exe` is on `PATH` or installed to `C:\Program Files\LOVE\`
+- Ensure the `love` executable is on `PATH`
 
 ---
 
 ## Environment Variables
 
-PolyBuild respects and sets the following variables during builds:
-
 | Variable | Used By | Purpose |
 |----------|---------|---------|
-| `GOOS` | Go | Force Windows target |
-| `GOARCH` | Go | Force amd64 architecture |
-| `RUSTFLAGS` | Rust | Static CRT linking (`-C target-feature=+crt-static`) |
-| `CC` / `CXX` | C/C++ | Compiler selection |
-| `CFLAGS` / `CXXFLAGS` | C/C++ | Optimization flags (`-O2`) |
+| `POLYBUILD_UPDATE_URL` | Self-updater | URL to download the new `polybuild.py` from |
+| `POLYBUILD_VERSION_URL` | Self-updater | URL to a JSON version manifest |
+| `GOOS` | Go | Set automatically when targeting Windows |
+| `GOARCH` | Go | Set automatically when targeting Windows |
+| `CC` / `CXX` | C/C++ (Makefile builds) | Compiler selection |
+| `CFLAGS` / `CXXFLAGS` | C/C++ (Makefile builds) | Optimization flags (`-O2`) |
 
 ---
 

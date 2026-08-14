@@ -24,6 +24,21 @@ from typing import List, Dict, Optional, Set
 from enum import Enum, auto
 from datetime import datetime
 
+# FIX: on Windows, the console's default codepage depends on the system
+# locale (e.g. cp1256 on Arabic Windows, cp936 on Chinese Windows) and is
+# very often NOT UTF-8. This script prints Unicode box-drawing characters
+# (─) and emoji (✓, ✗, etc.) unconditionally, which crashes with
+# UnicodeEncodeError the moment stdout can't represent them - confirmed
+# live: 'charmap' codec can't encode character '\u2500' on cp1256. Force
+# UTF-8 on stdout/stderr up front so this always works regardless of the
+# user's system locale, with errors="replace" as a last-resort safety net
+# for any truly unencodable byte.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 # ==================== VERSION & UPDATE ====================
 VERSION = "2.3.3"
@@ -159,22 +174,22 @@ class BaseToolInstaller:
         if not self._apt_available: return False
         sudo = [] if os.geteuid() == 0 else ["sudo"]
         subprocess.run(sudo + ["apt-get", "update", "-qq"], capture_output=True, timeout=180)
-        result = subprocess.run(sudo + ["apt-get", "install", "-y"] + package.split(), capture_output=True, text=True, timeout=300)
+        result = subprocess.run(sudo + ["apt-get", "install", "-y"] + package.split(), capture_output=True, text=True, errors="replace", timeout=300)
         return result.returncode == 0
 
     def install_via_brew(self, package: str) -> bool:
         if not self._brew_available: return False
-        result = subprocess.run(["brew", "install"] + package.split(), capture_output=True, text=True, timeout=300)
+        result = subprocess.run(["brew", "install"] + package.split(), capture_output=True, text=True, errors="replace", timeout=300)
         return result.returncode == 0
 
     def install_via_winget(self, package_id: str) -> bool:
         if not self._winget_available: return False
-        result = subprocess.run(["winget", "install", "--id", package_id, "-e", "--accept-source-agreements", "--accept-package-agreements"], capture_output=True, text=True, timeout=300)
+        result = subprocess.run(["winget", "install", "--id", package_id, "-e", "--accept-source-agreements", "--accept-package-agreements"], capture_output=True, text=True, errors="replace", timeout=300)
         return result.returncode == 0
 
     def install_via_choco(self, package: str) -> bool:
         if not self._choco_available: return False
-        result = subprocess.run(["choco", "install", package, "-y", "--no-progress"], capture_output=True, text=True, timeout=300)
+        result = subprocess.run(["choco", "install", package, "-y", "--no-progress"], capture_output=True, text=True, errors="replace", timeout=300)
         return result.returncode == 0
 
     def install_via_pkgmgr(self, apt_pkg=None, brew_pkg=None, choco_pkg=None, winget_id=None) -> bool:
@@ -255,7 +270,7 @@ class DependencyManager:
         tool_info = self.TOOLS.get(tool)
         if not tool_info: self.cache[tool] = False; return False
         try:
-            result = subprocess.run(tool_info['check'], capture_output=True, text=True, timeout=10, shell=(sys.platform == 'win32'))
+            result = subprocess.run(tool_info['check'], capture_output=True, text=True, errors="replace", timeout=10, shell=(sys.platform == 'win32'))
             installed = result.returncode == 0
             self.cache[tool] = installed
             return installed
@@ -313,7 +328,7 @@ class DependencyManager:
         try:
             if method == 'pip':
                 cmd = [sys.executable, "-m", "pip", "install", "--upgrade", tool_info.get('pkg', tool)]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                result = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=120)
                 if result.returncode == 0: self.cache[tool] = True; return True
                 return False
             elif method == 'npm':
@@ -324,7 +339,7 @@ class DependencyManager:
                 cmd.append(pkg)
                 install_cwd = cwd if (cwd and not tool_info.get('global', False)) else None
                 if install_cwd: os.makedirs(install_cwd, exist_ok=True)
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, cwd=install_cwd, shell=(sys.platform == 'win32'))
+                result = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=180, cwd=install_cwd, shell=(sys.platform == 'win32'))
                 if result.returncode == 0: self.cache[tool] = True; return True
                 return False
             elif method == 'pkgmgr':
@@ -345,7 +360,7 @@ class DependencyManager:
         # in BaseToolInstaller's winget/choco methods. Centralize both fixes.
         def _run_update(cmd, cwd=None):
             try:
-                r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=300)
+                r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, errors="replace", timeout=300)
                 return r.returncode == 0
             except Exception:
                 return False
@@ -589,6 +604,13 @@ class ProjectDetector:
         nim_score = 30 if self._has(".nimble") else 0
         if nim_score: candidates.append(DetectedProject(LangType.NIM, nim_score, self._find("main.nim"), []))
 
+        gm_score = 90 if self._has(".yyp") else 0
+        if gm_score: candidates.append(DetectedProject(LangType.GAMEMAKER, gm_score, None, []))
+
+        renpy_count = self._count(".rpy")
+        if renpy_count > 0:
+            candidates.append(DetectedProject(LangType.RENPY, min(renpy_count * 5, 70), None, []))
+
         zig_score = 40 if self._has("build.zig") else 0
         if zig_score: candidates.append(DetectedProject(LangType.ZIG, zig_score, self._find("main.zig"), ["build.zig"]))
 
@@ -635,7 +657,13 @@ class Builder:
         # or Electron packaging producing an NSIS installer — all routinely
         # exceed 10 minutes on a fresh machine or slow connection, and would
         # abort with a raw TimeoutExpired that just looked like "Build failed".
-        return subprocess.run(cmd, cwd=cwd or self.project_dir, capture_output=not self.args.verbose, text=True, env=env or os.environ.copy(), shell=shell, timeout=1800)
+        # FIX: errors="replace" - external build tools (npm, gradle, cargo,
+        # pip, etc.) can emit non-ASCII output (localized messages, package
+        # names) that the system locale's default codec can't decode (the
+        # same UnicodeDecodeError class as the earlier console-encoding fix,
+        # but here on the *reading* side for arbitrary subprocess output we
+        # don't control). Never let that crash an otherwise-successful build.
+        return subprocess.run(cmd, cwd=cwd or self.project_dir, capture_output=not self.args.verbose, text=True, errors="replace", env=env or os.environ.copy(), shell=shell, timeout=1800)
 
     def _find_file(self, pattern: str) -> Optional[str]:
         matches = glob.glob(os.path.join(self.project_dir, pattern), recursive=True)
@@ -1597,7 +1625,7 @@ class RubyBuilder(Builder):
         # if offline) instead of checking whether it's already present.
         if not shutil.which("ocra"):
             log("Installing ocra via gem...")
-            gem_result = subprocess.run(["gem", "install", "ocra"], capture_output=True, text=True, timeout=120)
+            gem_result = subprocess.run(["gem", "install", "ocra"], capture_output=True, text=True, errors="replace", timeout=120)
             if gem_result.returncode != 0:
                 error(f"Failed to install ocra via gem: {gem_result.stderr.strip()}")
         entry = self.args.script or self.project.entry_point or "main.rb"

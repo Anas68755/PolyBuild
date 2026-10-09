@@ -1,26 +1,44 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PolyBuild Pro v3.1 — أداة سطر أوامر شاملة لتحويل أي مشروع برمجي إلى ملف تنفيذي
-أصلي (EXE / APK / Binary) للنظام المُستهدف.
+PolyBuild Pro v3.3.1 — a single-file CLI tool that turns any software project
+into a native executable (EXE / APK / binary) for the target system.
 
-- ملف واحد يعمل على Windows / Linux / macOS مع Python 3.9+ .
-- بدون اعتمادات pip إلزامية (Standard Library فقط).
-- يكتشف لغة المشروع تلقائيًا (نظام نقاط Confidence)، يثبّت الأدوات الناقصة
-  إن أمكن، ويبني عبر Builder مخصص لكل لغة (25+ لغة/بيئة).
-- تكامل مع أداة Toolbox كوحدة داخلية عبر subprocess.
+- Runs on Windows / Linux / macOS with Python 3.9+.
+- No mandatory pip dependencies (Standard Library only).
+- Auto-detects the project language (confidence-score system), can install
+  missing tools (--auto-install), and builds via a dedicated builder for each
+  language (26+ languages/environments).
+- Fully non-interactive: every decision comes from command-line flags.
 
-الاستخدام السريع:
-    python polybuild.py                       # معالج تفاعلي (على TTY)
-    python polybuild.py -p ./myapp -n myapp   # كشف تلقائي + بناء
-    python polybuild.py -p . --lang python -f # فرض اللغة + onefile
-    python polybuild.py --check-tools         # حالة كل الأدوات
-    python polybuild.py --update              # تحديث PolyBuild نفسه
+[toolbox compat] This build is designed to be driven by Ultimate Toolbox Pro
+(tool "🏗️ PolyBuild"), which calls:
+    python polybuild.py <PROJECT> [--lang NAME] [--backend NAME]
+        [--target OS] [--output DIR] [--onefile] [--console] [--clean]
+        [--hidden-import MOD]... [--add-data SRC:DEST]... [extra flags...]
+All of those flags are accepted here: PROJECT may be a folder or a single
+source file; --lang accepts toolbox names (javascript, typescript, csharp,
+php ...) as aliases of the canonical ones; --backend accepts the toolbox
+backend names and is honored wherever the toolchain supports it (otherwise
+a clear warning is shown and the default backend is used).
 
-متغيرات البيئة:
-    POLYBUILD_VERSION_URL  رابط JSON يعلن أحدث إصدار + sha256 + url
-    POLYBUILD_UPDATE_URL   رابط تحميل السكربت الجديد (مطلوب مع --update)
-    POLYBUILD_NO_UPDATE_CHECK = 1  لتعطيل فحص التحديث عند الإقلاع
+Quick usage:
+    python polybuild.py                              # build the current directory
+    python polybuild.py ./myapp -n myapp             # positional project (toolbox style)
+    python polybuild.py -p ./myapp -n myapp          # auto-detect + build
+    python polybuild.py -p . --lang python -f        # force language + onefile
+    python polybuild.py -p . --entry src/app.py      # explicit entry point
+    python polybuild.py -s tools/app.py              # build ONE specific file
+    python polybuild.py tools/app.py                 # same, via positional single file
+    python polybuild.py -p . -f --icon assets/app.ico
+    python polybuild.py -p . --add-data assets:assets --add-data README.md:.
+    python polybuild.py -p . --backend nuitka        # toolbox backend hint
+    python polybuild.py --check-tools | --list-langs | --update
+
+Environment variables:
+    POLYBUILD_VERSION_URL       JSON with latest version + sha256 + url
+    POLYBUILD_UPDATE_URL        download URL of the new script (needed by --update)
+    POLYBUILD_NO_UPDATE_CHECK=1 skip the silent startup update check
 """
 
 from __future__ import annotations
@@ -33,7 +51,6 @@ import json
 import os
 import platform
 import re
-import select
 import shutil
 import stat
 import subprocess
@@ -49,23 +66,24 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 2) ثوابت الإصدار والإعدادات
+# 2) Version constants and settings
 # ═══════════════════════════════════════════════════════════════════════════
 TOOL_NAME = "PolyBuild Pro"
-VERSION = "3.1.0"
-VERSION_TAG = "v3.1"
+VERSION = "3.3.1"
+VERSION_TAG = "v3.3.1"
 
-# مهل صريحة لكل subprocess — لا شيء يعمل بلا حد زمني (متطلب أمان)
-TIMEOUT_SHORT = 60      # استعلامات سريعة (--version ...)
-TIMEOUT_MED = 180       # خطوات وسيطة (cmake configure ...)
-TIMEOUT_LONG = 900      # تجميعات ثقيلة (pyinstaller / cargo / gradle ...)
-TIMEOUT_PKG = 600       # تثبيت الحزم (apt / brew / npm / pip ...)
+# Explicit timeouts for every subprocess — nothing runs unbounded (safety).
+TIMEOUT_SHORT = 60      # quick queries (--version ...)
+TIMEOUT_MED = 180       # intermediate steps (cmake configure ...)
+TIMEOUT_LONG = 900      # heavy builds (pyinstaller / cargo / gradle ...)
+TIMEOUT_XLONG = 2400    # very heavy builds (flutter / full gradle / maven ...)
+TIMEOUT_PKG = 600       # package installation (apt / brew / npm / pip ...)
 
 ENV_VERSION_URL = "POLYBUILD_VERSION_URL"
 ENV_UPDATE_URL = "POLYBUILD_UPDATE_URL"
 ENV_NO_UPDATE_CHECK = "POLYBUILD_NO_UPDATE_CHECK"
 
-# مجلدات تُستثنى من الفحص والرَّدم (بناء/تخزين مؤقت/VCS)
+# Folders excluded from scanning/packing (build / cache / VCS)
 EXCLUDE_DIRS = {
     ".git", ".hg", ".svn", ".github", ".idea", ".vs", ".vscode",
     "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache",
@@ -77,19 +95,19 @@ EXCLUDE_DIRS = {
 }
 
 DEFAULT_OUTPUT_DIR = "dist"
-MAX_SCAN_FILES = 5000     # سقف حماية أداء أثناء فحص المشاريع الضخمة
+MAX_SCAN_FILES = 5000     # performance guard while scanning huge projects
 MAX_SCAN_DEPTH = 7
 
-# أنظمة الهدف المدعومة لخيار --target-os
+# Supported values for --target-os
 TARGET_OS_CHOICES = ("native", "windows", "linux", "macos", "android")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 3) أدوات الطرفية: ألوان ANSI + رموز Unicode + صناديق + طباعة موحّدة
+# 3) Terminal utilities: ANSI colors + Unicode symbols + boxes + printing
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _force_utf8_stdio() -> None:
-    """[إصلاح حرج] إعادة تهيئة stdout/stderr إلى UTF-8 عند الإقلاع لتفادي
-    انفجار الترميز على Windows (cp1252/cp437) مع الرموز والعربية."""
+    """[critical fix] Reconfigure stdout/stderr to UTF-8 at startup to avoid
+    encoding crashes on Windows (cp1252/cp437) with symbols and non-ASCII."""
     for stream in (sys.stdout, sys.stderr):
         try:
             if stream is not None and hasattr(stream, "reconfigure"):
@@ -114,7 +132,7 @@ class Ansi:
 
 
 def _detect_color() -> bool:
-    """كشف دعم الطرفية للألوان — يحترم NO_COLOR ويدعم Windows Terminal/VT."""
+    """Detect terminal color support — honors NO_COLOR and Windows Terminal/VT."""
     if os.environ.get("NO_COLOR"):
         return False
     if os.environ.get("FORCE_COLOR") or os.environ.get("CLICOLOR_FORCE") == "1":
@@ -127,7 +145,7 @@ def _detect_color() -> bool:
     if os.name == "nt":
         if os.environ.get("WT_SESSION") or os.environ.get("ANSICON"):
             return True
-        # [إصلاح حرج] تمكين VT100 على conhost عبر SetConsoleMode بدل os.system("")
+        # [critical fix] Enable VT100 on conhost via SetConsoleMode
         try:
             import ctypes
             k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
@@ -142,7 +160,7 @@ def _detect_color() -> bool:
 
 
 def _detect_unicode() -> bool:
-    """هل يمكن ترميز رموزنا على التدفق الحالي؟ وإلا نرجع لبدائل ASCII."""
+    """Can the current stream encode our symbols? Otherwise fall back to ASCII."""
     probe = "✓✗⚠→❯╔═║"
     try:
         enc = (sys.stdout.encoding or "ascii").lower()
@@ -186,27 +204,27 @@ def _emit(prefix: str, color: str, msg: str, stream: Any = None) -> None:
 
 
 def info(msg: str) -> None:
-    """[*] معلومات — أزرق."""
+    """[*] info — blue."""
     _emit("[*]", Ansi.BLUE, msg)
 
 
 def ok(msg: str) -> None:
-    """[✓] نجاح — أخضر."""
+    """[ok] success — green."""
     _emit(f"[{SYM['ok']}]", Ansi.GREEN, msg)
 
 
 def warn(msg: str) -> None:
-    """[!] تحذير — أصفر."""
+    """[!] warning — yellow."""
     _emit("[!]", Ansi.YELLOW, msg)
 
 
 def err(msg: str) -> None:
-    """[✗] خطأ — أحمر (على stderr)."""
+    """[x] error — red (to stderr)."""
     _emit(f"[{SYM['err']}]", Ansi.RED, msg, stream=sys.stderr)
 
 
 def hint(msg: str) -> None:
-    """[i] تلميح — سماوي."""
+    """[i] hint — cyan."""
     _emit("[i]", Ansi.CYAN, msg)
 
 
@@ -223,7 +241,7 @@ def _box_char(name: str) -> str:
 
 
 def _visible_len(s: str) -> int:
-    """طول العرض التقريبي — يعتبر كل الحروف خلية واحدة (يكفي لمحاذاتنا)."""
+    """Approximate display width — every char counts as one cell."""
     return len(s)
 
 
@@ -235,11 +253,14 @@ def _pad(s: str, width: int) -> str:
 def _clip(s: str, width: int) -> str:
     if _visible_len(s) <= width:
         return s
-    return s[: max(0, width - 1)] + "…"
+    return s[: max(0, width - 3)] + ("…" if UNICODE else "...")
 
 
 def render_box(title: str = "", rows: Optional[List[Any]] = None, width: int = 62) -> None:
-    """صندوق Unicode: rows عناصرها إمّا سطر نص حر أو tuple(label, value)."""
+    """Unicode box: rows are either free text lines or (label, value) tuples.
+    [fix v3.3.1] the composed (label : value) line is clipped+padded to the
+    inner width at the end — long paths can no longer push the right border
+    out of alignment."""
     rows = list(rows or [])
     inner = width - 2
     h, v = _box_char("h"), _box_char("v")
@@ -259,49 +280,53 @@ def render_box(title: str = "", rows: Optional[List[Any]] = None, width: int = 6
             line = f" {_pad(_clip(str(label), inner // 3), inner // 3)} : {_clip(str(value), inner - inner // 3 - 5)} "
         else:
             line = f" {_clip(str(row), inner - 2)} "
-        print(paint(v, Ansi.CYAN) + paint(_pad(line, inner), Ansi.WHITE) + paint(v, Ansi.CYAN))
+        line = _pad(_clip(line, inner), inner)   # [fix] never overflow the box
+        print(paint(v, Ansi.CYAN) + paint(line, Ansi.WHITE) + paint(v, Ansi.CYAN))
     print(edge(_box_char("bl"), _box_char("br")))
 
 
 def summary_panel(file_path: Path, elapsed: float, lang_label: str,
                   tool_label: str, extra: Optional[List[Tuple[str, str]]] = None) -> None:
-    """شريط الملخص النهائي: الملف/الحجم/الزمن/اللغة."""
+    """Final summary panel: file / size / time / language."""
     is_dir = file_path.is_dir()
-    if is_dir:
-        total = sum(f.stat().st_size for f in file_path.rglob("*") if f.is_file())
-    else:
-        total = file_path.stat().st_size if file_path.exists() else 0
+    try:
+        if is_dir:
+            total = sum(f.stat().st_size for f in file_path.rglob("*") if f.is_file())
+        else:
+            total = file_path.stat().st_size if file_path.exists() else 0
+    except OSError:
+        total = 0
     rows: List[Tuple[str, str]] = [
-        ("اسم الملف", file_path.name),
-        ("المسار", str(file_path)),
-        ("الحجم", human_size(total) + (" (مجلد)" if is_dir else "")),
-        ("الزمن", f"{elapsed:.1f}s"),
-        ("اللغة", lang_label),
-        ("الأداة", tool_label),
+        ("File", file_path.name),
+        ("Path", str(file_path)),
+        ("Size", human_size(total) + (" (folder)" if is_dir else "")),
+        ("Time", f"{elapsed:.1f}s"),
+        ("Language", lang_label),
+        ("Tool", tool_label),
     ]
     for kv in (extra or []):
         rows.append(kv)
-    render_box(f"{TOOL_NAME} {VERSION_TAG} — البناء اكتمل بنجاح", rows, width=70)
+    render_box(f"{TOOL_NAME} {VERSION_TAG} — build completed successfully", rows, width=70)
 
 
 def print_banner() -> None:
     render_box(
         f"{TOOL_NAME} {VERSION_TAG}  ({VERSION})",
-        ["من أي مشروع برمجي " + SYM["arrow"] + " ملف تنفيذي أصلي",
-         "25+ لغة | كشف تلقائي | تثبيت التبعيات | بدون اعتمادات pip"],
+        ["Any software project " + SYM["arrow"] + " one native executable",
+         "25+ languages | auto-detection | icon & data bundling | zero pip deps"],
         width=62,
     )
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 4) أدوات Helpers عامة
+# 4) General-purpose helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
 class BuildError(Exception):
-    """فشل بناء — تُعرض رسالتها للمستخدم كما هي (بالأحمر)."""
+    """Build failure — its message is shown to the user as-is (in red)."""
 
 
 class GuidanceBuild(Exception):
-    """لغات "كشف بدون بناء" (Unity/Unreal/...) — تعرض إرشادات بدل البناء."""
+    """Detect-only languages (Unity/Unreal/...) — show manual steps instead."""
 
     def __init__(self, title: str, steps: List[str]):
         super().__init__(title)
@@ -309,12 +334,8 @@ class GuidanceBuild(Exception):
         self.steps = steps
 
 
-class UserCancel(Exception):
-    """ألغى المستخدم من المعالج التفاعلي (Esc / Ctrl+C)."""
-
-
 def which_cmd(tool: str, refresh: bool = False) -> Optional[str]:
-    """shutil.which مع cache — refresh لإجبار إعادة الفحص بعد تثبيت الأب."""
+    """shutil.which with a cache — refresh forces a re-check after installs."""
     cache: Dict[str, Optional[str]] = getattr(which_cmd, "_cache", {})
     if refresh:
         cache.pop(tool, None)
@@ -325,27 +346,33 @@ def which_cmd(tool: str, refresh: bool = False) -> Optional[str]:
 
 
 def invalidate_tool_cache(*tools: str) -> None:
-    """إبطاء الكاش بعد أي تثبيت — لا نفترض أن الابن (npm) جاء مع الأب (node)."""
+    """Invalidate the cache after any install — never assume a child (npm)
+    arrived together with its parent (node).
+    [fix v3.3.1] safe when the cache does not exist yet (used to silently
+    clear a throw-away dict)."""
+    cache = getattr(which_cmd, "_cache", None)
+    if cache is None:
+        return
     if not tools:
-        getattr(which_cmd, "_cache", {}).clear()
+        cache.clear()
         return
     for t in tools:
         which_cmd(t, refresh=True)
 
 
 def exe_ext(target_os: str) -> str:
-    """امتداد الملف التنفيذي حسب النظام الهدف."""
+    """Executable extension for the target OS."""
     return ".exe" if target_os == "windows" else ""
 
 
 def current_os() -> str:
-    """نظام الاستضافة الحالي بصيغة موحّدة."""
+    """Current host OS in normalized form."""
     return {"Windows": "windows", "Darwin": "macos"}.get(platform.system(), "linux")
 
 
 def resolve_target_os(target_os: str) -> str:
-    """native = نفس نظام الاستضافة."""
-    return current_os() if target_os in ("native", "", None) else target_os
+    """native/host = same as the host OS (host accepted for toolbox compat)."""
+    return current_os() if target_os in ("native", "host", "", None) else target_os
 
 
 def version_tuple(v: str) -> Tuple[int, ...]:
@@ -354,7 +381,7 @@ def version_tuple(v: str) -> Tuple[int, ...]:
 
 
 def is_newer_version(candidate: str, current: str) -> bool:
-    """مقارنة إصدارات مرنة (3.1.0 مقابل 3.1 مقابل v3.1.1 ...)."""
+    """Flexible version comparison (3.1.0 vs 3.1 vs v3.1.1 ...)."""
     a, b = version_tuple(candidate), version_tuple(current)
     n = max(len(a), len(b))
     a += (0,) * (n - len(a))
@@ -366,14 +393,6 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def sha256_hex_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 16), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def human_size(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
@@ -383,7 +402,7 @@ def human_size(n: float) -> str:
 
 
 def sanitize_name(name: str) -> str:
-    """اسم مخرج آمن: مسافات → _ وقص الرموز الخطرة."""
+    """Safe output name: spaces -> _ and strip dangerous characters."""
     name = re.sub(r"[^\w.\-]+", "_", (name or "").strip())
     return name.strip("._") or "app"
 
@@ -396,7 +415,7 @@ def read_small_text(path: Path, limit: int = 512 * 1024) -> str:
 
 
 def tail_lines(text: str, n: int = 6) -> str:
-    """آخر n سطر غير فارغة — لعرض أخطاء الأدوات الخارجية باقتضاب."""
+    """Last n non-empty lines — to show external tool errors concisely."""
     lines = [ln for ln in (text or "").splitlines() if ln.strip()]
     keep = lines[-n:]
     return "\n".join("    " + ln.strip()[:180] for ln in keep)
@@ -405,9 +424,9 @@ def tail_lines(text: str, n: int = 6) -> str:
 def run_cmd(cmd: Sequence[str], cwd: Optional[Path] = None,
             timeout: int = TIMEOUT_MED, env: Optional[Dict[str, str]] = None,
             capture: bool = True) -> subprocess.CompletedProcess:
-    """[إصلاح حرج] نقطة تنفيذ واحدة لكل العمليات الخارجية:
-    timeout صريح دائمًا + text=True + errors='replace' (لا UnicodeDecodeError
-    من أدوات خارجية) + لا shell=True إطلاقًا."""
+    """[critical fix] Single execution point for every external process:
+    always an explicit timeout + text=True + errors='replace' (never a
+    UnicodeDecodeError from external tools) + never shell=True."""
     merged = None
     if env:
         merged = dict(os.environ)
@@ -425,17 +444,17 @@ def run_cmd(cmd: Sequence[str], cwd: Optional[Path] = None,
             shell=False,
         )
     except subprocess.TimeoutExpired:
-        raise BuildError(f"انتهت المهلة ({timeout}s) أثناء تنفيذ: {cmd[0]} …")
+        raise BuildError(f"Timed out ({timeout}s) while running: {cmd[0]}")
     except FileNotFoundError:
-        raise BuildError(f"الأداة غير موجودة: {cmd[0]} — ثبّتها أولًا أو حدّد مسارها.")
+        raise BuildError(f"Tool not found: {cmd[0]} — install it first or add it to PATH.")
     except PermissionError:
-        raise BuildError(f"لا صلاحية لتنفيذ: {cmd[0]}")
+        raise BuildError(f"Permission denied while executing: {cmd[0]}")
 
 
 def collect_files(root: Path, extra_excludes: Optional[set] = None,
                   max_files: int = MAX_SCAN_FILES,
                   max_depth: int = MAX_SCAN_DEPTH) -> List[Path]:
-    """ردم المشروع مع استثناء مجلدات البناء/الكاش — بسقوف حماية للأداء."""
+    """Walk the project excluding build/cache folders — with performance caps."""
     found: List[Path] = []
     excludes = set(EXCLUDE_DIRS) | set(extra_excludes or ())
     base_depth = len(root.parts)
@@ -472,8 +491,126 @@ def regex_first(text: str, pattern: str, group: int = 1) -> Optional[str]:
     m = re.search(pattern, text, re.MULTILINE)
     return m.group(group).strip() if m else None
 
+
+def find_files_by_ext(root: Path, ext: str, limit: int = 3000,
+                      excludes: Optional[set] = None) -> List[Path]:
+    """Like collect_files but does NOT skip build output folders — used to
+    locate produced artifacts (build/, target/, app/build/...)."""
+    skip = excludes if excludes is not None else {
+        ".git", ".gradle", ".dart_tool", ".idea", ".vscode",
+        "node_modules", ".polybuild_tmp",
+    }
+    out: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        for fn in filenames:
+            if fn.lower().endswith(ext):
+                out.append(Path(dirpath) / fn)
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+def find_native_binaries(root: Path, target_os: str, max_items: int = 3000) -> List[Path]:
+    """Locate built executables under *root*, skipping VCS/cache junk.
+    [fix] Does not exclude target/build — the old scan could never find
+    build outputs because they live inside excluded folders."""
+    skip_dirs = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".polybuild_tmp"}
+    bad_ext = {".o", ".a", ".so", ".dylib", ".lib", ".exp", ".pdb", ".d", ".txt",
+               ".cmake", ".json", ".h", ".hpp", ".c", ".cc", ".cpp", ".cxx",
+               ".ninja", ".log", ".md", ".py", ".jar", ".xml", ".yml", ".yaml",
+               ".toml", ".lock", ".mod", ".sum", ".rs", ".go", ".nim", ".cr",
+               ".kt", ".java", ".cs", ".dll", ".png", ".jpg", ".jpeg", ".ico",
+               ".zip", ".tar", ".gz", ".plist", ".icns", ".def", ".stamp"}
+    out: List[Path] = []
+    if not root.exists():
+        return out
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for fn in filenames:
+            if len(out) >= max_items:
+                return out
+            p = Path(dirpath) / fn
+            try:
+                suf = p.suffix.lower()
+                if suf in bad_ext:
+                    continue
+                if target_os == "windows":
+                    if suf != ".exe":
+                        continue
+                else:
+                    if suf == ".exe":
+                        continue
+                    with open(p, "rb") as fh:   # skip shell scripts
+                        if fh.read(2) == b"#!":
+                            continue
+                if p.stat().st_size < 1024:
+                    continue
+                out.append(p)
+            except OSError:
+                continue
+    return out
+
+
+# ---------- [new in v3.3] --icon / --add-data helpers ----------
+
+def split_data_spec(raw: str) -> Tuple[str, Optional[str]]:
+    """Split 'SRC:DEST' / 'SRC;DEST' / 'SRC' into (src, dest).
+    [fix v3.3.1] Windows drive letters (C:\\...) are preserved: the drive
+    prefix is split off first and re-attached to the source, so 'C:\\data'
+    no longer collapses into '\\data' (the old bug lost the drive letter
+    and made every absolute Windows --add-data source fail with
+    'source not found')."""
+    s = raw.strip()
+    m = re.match(r"^([A-Za-z]:)(.*)$", s)
+    drive = m.group(1) if m else ""
+    rest = m.group(2) if m else s
+    for sep in (";", ":"):
+        i = rest.find(sep)
+        if i >= 0:
+            src = (drive + rest[:i]).strip()
+            return (src or drive), (rest[i + 1:].strip() or None)
+    return (drive + rest).strip(), None
+
+
+def resolve_data_specs(specs: Sequence[str], project: Path) -> List[Tuple[Path, str]]:
+    """Resolve repeated --add-data specs into (source_path, dest_inside_bundle).
+    Each source is looked up under the project root first, then the cwd.
+    Destination is normalized to a POSIX relative path; '.' means the source
+    keeps its own name at the bundle root."""
+    out: List[Tuple[Path, str]] = []
+    for raw in specs:
+        src_s, dest = split_data_spec(raw)
+        if not src_s:
+            raise BuildError(f"--add-data: empty source in {raw!r}")
+        cand = Path(src_s).expanduser()
+        found: Optional[Path]
+        if cand.is_absolute():
+            found = cand if cand.exists() else None
+        else:
+            found = None
+            for base in (project, Path.cwd()):
+                if (base / cand).exists():
+                    found = base / cand
+                    break
+        if found is None:
+            raise BuildError(f"--add-data: source not found: {raw!r} "
+                             f"(looked under {project} and the current directory)")
+        if found.resolve() == project.resolve():
+            raise BuildError("--add-data: refusing to bundle the whole project "
+                             "root into itself.")
+        dest = (dest or found.name).replace("\\", "/").strip("/")
+        while dest.startswith("./"):
+            dest = dest[2:]
+        if dest == ".":
+            dest = found.name
+        if not dest:
+            raise BuildError(f"--add-data: empty destination in {raw!r}")
+        out.append((found.resolve(), dest))
+    return out
+
 # ═══════════════════════════════════════════════════════════════════════════
-# 5) الأنواع: LangType + DetectedProject
+# 5) Types: LangType + DetectedProject
 # ═══════════════════════════════════════════════════════════════════════════
 
 class LangType(Enum):
@@ -499,6 +636,7 @@ class LangType(Enum):
     ELECTRON = "electron"
     ANDROID = "android"
     GODOT = "godot"
+    PHP = "php"
     UNITY = "unity"
     UNREAL = "unreal"
     GAMEMAKER = "gamemaker"
@@ -506,7 +644,6 @@ class LangType(Enum):
     UNKNOWN = "unknown"
 
 
-# تسميات عربية للعرض في القوائم والملخصات
 LANG_LABELS: Dict[LangType, str] = {
     LangType.PYTHON: "Python",
     LangType.NODE: "Node.js",
@@ -530,20 +667,21 @@ LANG_LABELS: Dict[LangType, str] = {
     LangType.ELECTRON: "Electron",
     LangType.ANDROID: "Android (Gradle)",
     LangType.GODOT: "Godot",
+    LangType.PHP: "PHP",
     LangType.UNITY: "Unity",
     LangType.UNREAL: "Unreal Engine",
     LangType.GAMEMAKER: "GameMaker",
     LangType.RENPY: "Ren'Py",
-    LangType.UNKNOWN: "غير معروفة",
+    LangType.UNKNOWN: "Unknown",
 }
 
 
 @dataclass
 class DetectedProject:
-    """نتيجة الكشف التلقائي عن المشروع."""
+    """Result of automatic project detection."""
     lang: LangType = LangType.UNKNOWN
     confidence: float = 0.0          # 0..1
-    score: int = 0                   # النقاط الخام
+    score: int = 0                   # raw score
     evidence: List[str] = field(default_factory=list)
     entry_point: Optional[str] = None
     project_name: Optional[str] = None
@@ -553,38 +691,42 @@ class DetectedProject:
         return LANG_LABELS.get(self.lang, self.lang.value)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 6) نظام التحديث الذاتي — تحقق ثلاثي + rollback
+# 6) Self-update system — triple verification + rollback (no prompts)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class SelfUpdater:
-    """يحمّل نسخة أحدث من السكربت نفسه ويتحقق ثلاثيًا قبل الاستبدال:
-      1) مطابقة SHA-256 مع ما يعلنه السيرفر (لا ثقة بمحتوى بلا hash صريح).
-      2) ast.parse() للسلامة النحوية.
-      3) py_compile.compile() لقابلية الترجمة.
-    أي فشل → استرجاع تلقائي من نسخة .backup."""
+    """Downloads a newer version of this script and verifies it three ways
+    before replacing anything:
+      1) SHA-256 must match what the server declares (no content without a hash).
+      2) ast.parse() for syntactic sanity.
+      3) py_compile.compile() for actual compilability.
+    Any failure -> automatic rollback from the .backup copy.
+
+    [fix] Fully non-interactive: --update is an explicit command, so it never
+    asks for confirmation. Also fixed the NameError in the finally block.
+    """
 
     BACKUP_SUFFIX = ".backup"
 
-    def __init__(self, assume_yes: bool = False):
-        self.assume_yes = assume_yes
+    def __init__(self):
         self.target = Path(os.path.abspath(__file__))
 
-    # ---------- الشبكة ----------
+    # ---------- network ----------
     def _fetch(self, url: str, timeout: int = TIMEOUT_MED) -> bytes:
         req = urllib.request.Request(url, headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read()
 
     def latest_info(self) -> Optional[Dict[str, str]]:
-        """يتوقع JSON: {"version": "...", "sha256": "...", "url": "..."} —
-        أو نصًا بسيطًا يحمل رقم الإصدار فقط (بدون hash)."""
+        """Expects JSON: {"version": "...", "sha256": "...", "url": "..."} —
+        or a plain text body carrying the version number only (no hash)."""
         url = os.environ.get(ENV_VERSION_URL, "").strip()
         if not url:
             return None
         try:
             raw = self._fetch(url, timeout=10)
         except Exception as e:
-            warn(f"تعذّر فحص التحديث: {e.__class__.__name__}")
+            warn(f"Update check failed: {e.__class__.__name__}")
             return None
         text = raw.decode("utf-8", errors="replace").strip()
         try:
@@ -597,25 +739,25 @@ class SelfUpdater:
             return {"version": text.splitlines()[0].strip(), "sha256": "", "url": ""}
         return None
 
-    # ---------- التحقق ----------
+    # ---------- verification ----------
     def _verify(self, content: bytes, declared_sha: str) -> None:
         if not declared_sha:
-            # [إصلاح أمني] لا نثق بأي محتوى بدون hash صريح من السيرفر
-            raise BuildError("السيرفر لا يعلن SHA-256 للمحتوى — رفض التحديث لأسباب أمنية.")
+            # [security fix] never trust content without an explicit hash
+            raise BuildError("The server does not declare a SHA-256 — refusing the update for security reasons.")
         actual = sha256_bytes(content)
         if not hmac.compare_digest(actual, declared_sha.strip().lower()):
-            raise BuildError(f"عدم تطابق SHA-256!\n  المعلن : {declared_sha}\n  الفعلي : {actual}")
+            raise BuildError(f"SHA-256 mismatch!\n  declared: {declared_sha}\n  actual  : {actual}")
         try:
             ast.parse(content.decode("utf-8", errors="strict"), filename="update.py")
         except SyntaxError as e:
-            raise BuildError(f"المحتوى المُحمّل ليس كود Python سليمًا (ast): {e}")
+            raise BuildError(f"The downloaded content is not valid Python (ast): {e}")
         tmp_src = Path(tempfile.gettempdir()) / f"polybuild_check_{os.getpid()}.py"
         try:
             tmp_src.write_bytes(content)
             import py_compile
             py_compile.compile(str(tmp_src), cfile=str(tmp_src) + "c", doraise=True)
         except Exception as e:
-            raise BuildError(f"فشل الترجمة التجريبية للتحديث (py_compile): {e}")
+            raise BuildError(f"Trial compilation of the update failed (py_compile): {e}")
         finally:
             try:
                 tmp_src.unlink(missing_ok=True)
@@ -623,73 +765,72 @@ class SelfUpdater:
             except Exception:
                 pass
 
-    # ---------- الاستبدال + Rollback ----------
+    # ---------- replacement + rollback ----------
     def _replace(self, content: bytes) -> None:
         backup = self.target.with_name(self.target.name + self.BACKUP_SUFFIX)
+        # [fix] define tmp up-front: the old code could raise NameError in finally
+        tmp = self.target.with_name(self.target.name + ".new")
         try:
             shutil.copy2(self.target, backup)
-            tmp = self.target.with_name(self.target.name + ".new")
             tmp.write_bytes(content)
             os.chmod(tmp, stat.S_IMODE(os.stat(self.target).st_mode) | stat.S_IXUSR)
             os.replace(tmp, self.target)
-            # تحقق نهائي: النسخة الجديدة قابلة للترجمة فعلًا على مكانها
+            # final check: the new version actually compiles in place
             import py_compile
             py_compile.compile(str(self.target), cfile=str(tmp) + "c", doraise=True)
         except Exception as e:
-            if backup.exists():
-                shutil.copy2(backup, self.target)   # rollback تلقائي
-            raise BuildError(f"فشل الاستبدال — تمت الاستعادة من .backup: {e}")
+            try:
+                if backup.exists():
+                    shutil.copy2(backup, self.target)   # automatic rollback
+            except Exception:
+                pass
+            raise BuildError(f"Self-update failed — the original was restored from .backup: {e}")
         finally:
             try:
                 Path(str(tmp) + "c").unlink(missing_ok=True)
             except Exception:
                 pass
 
-    # ---------- الواجهات ----------
+    # ---------- public API ----------
     def check_at_startup(self) -> None:
-        """فحص صامت سريع عند الإقلاع — لا يعطل التشغيل أبدًا."""
+        """Silent, quick check at startup — never blocks normal operation."""
         if os.environ.get(ENV_NO_UPDATE_CHECK) == "1":
             return
         info_ = self.latest_info()
         if info_ and info_.get("version") and is_newer_version(info_["version"], VERSION):
-            hint(f"يتوفر إصدار أحدث ({info_['version']}). شغّل: python {self.target.name} --update")
+            hint(f"A newer version is available ({info_['version']}). Run: python {self.target.name} --update")
 
     def run(self) -> None:
         if not (os.environ.get(ENV_VERSION_URL) or os.environ.get(ENV_UPDATE_URL)):
             raise BuildError(
-                "حدّد " + ENV_VERSION_URL + " و" + ENV_UPDATE_URL +
-                " قبل التحديث.\n  مثال: POLYBUILD_VERSION_URL=https://host/version.json"
-            )
-        info("جارٍ فحص أحدث إصدار …")
+                "Set " + ENV_VERSION_URL + " and " + ENV_UPDATE_URL +
+                " before updating.\n  Example: POLYBUILD_VERSION_URL=https://host/version.json")
+        info("Checking for the latest version ...")
         info_ = self.latest_info() or {}
         latest = info_.get("version", "")
         if not latest:
-            raise BuildError("تعذّر معرفة أحدث إصدار من " + ENV_VERSION_URL)
+            raise BuildError("Could not determine the latest version from " + ENV_VERSION_URL)
         if not is_newer_version(latest, VERSION):
-            ok(f"أنت تستخدم أحدث إصدار ({VERSION}).")
+            ok(f"You are already using the latest version ({VERSION}).")
             return
         url = info_.get("url") or os.environ.get(ENV_UPDATE_URL, "")
         if not url:
-            raise BuildError("لا يوجد رابط تحميل (" + ENV_UPDATE_URL + " أو url من JSON الإصدار).")
-        info(f"تحميل الإصدار {latest} …")
+            raise BuildError("No download URL found (" + ENV_UPDATE_URL + " or 'url' from the version JSON).")
+        info(f"Downloading version {latest} ...")
         content = self._fetch(url, timeout=TIMEOUT_LONG)
         self._verify(content, info_.get("sha256", ""))
-        ok("التحقق الثلاثي ناجح (SHA-256 + ast + py_compile).")
-        if not self.assume_yes and sys.stdin.isatty():
-            ans = input(paint("تثبيت الإصدار الجديد الآن؟ [Y/n]: ", Ansi.BOLD)).strip().lower()
-            if ans in ("n", "no"):
-                info("أُلغي التحديث.")
-                return
+        ok("Triple verification passed (SHA-256 + ast + py_compile).")
+        # [fix] no confirmation prompt: --update is explicit consent
         self._replace(content)
-        ok(f"تم التحديث إلى {latest}. أعد التشغيل لتطبيق التغييرات.")
+        ok(f"Updated to {latest}. Restart to apply the changes.")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 7) BaseToolInstaller — كشف مدير الحزم وتثبيت الأدوات
+# 7) BaseToolInstaller — detect the package manager and install tools
 # ═══════════════════════════════════════════════════════════════════════════
 
 class BaseToolInstaller:
-    """يكشف مدير الحزم المتاح (apt/brew/winget/choco + pip/gem/cpan) ويثبّت الأدوات.
-    لا يستخدم sudo إلا عند الحاجة الفعلية."""
+    """Detects the available package manager (apt/brew/winget/choco plus
+    pip/gem/cpan) and installs tools. Uses sudo only when truly needed."""
 
     def __init__(self) -> None:
         self.manager = self._detect_manager()
@@ -705,7 +846,7 @@ class BaseToolInstaller:
                 return "winget"
             if which_cmd("choco"):
                 return "choco"
-        # مديرات لغوية إضافية تعمل في كل الأنظمة
+        # extra language managers that work on every OS
         if which_cmd(sys.executable) and self._pip_ok():
             return "pip"
         return None
@@ -723,7 +864,7 @@ class BaseToolInstaller:
         return self.manager is not None
 
     def _needs_sudo(self) -> bool:
-        # [إصلاح] لا sudo إلا عند الحاجة: apt خارج الجذر فقط
+        # [fix] sudo only when needed: apt outside root only
         if self.manager != "apt":
             return False
         if hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -731,8 +872,8 @@ class BaseToolInstaller:
         return which_cmd("sudo") is not None
 
     def install(self, packages: Dict[str, Any]) -> bool:
-        """packages: {manager: pkg أو [pkgs]} — يجرب مدير النظام ثم مديرات اللغات
-        (pip/gem/cpan) كاحتياط — timeout صريح دائمًا."""
+        """packages: {manager: pkg or [pkgs]} — tries the system manager then
+        the language managers (pip/gem/cpan) as a fallback."""
         order: List[str] = [self.manager] if self.manager else []
         for mgr in ("pip", "gem", "cpan"):
             if mgr not in order and self._mgr_ready(mgr):
@@ -760,7 +901,12 @@ class BaseToolInstaller:
         if mgr == "apt":
             base = (["sudo"] if self._needs_sudo() else []) + ["apt-get", "install", "-y"] + pkgs
         elif mgr == "brew":
-            base = ["brew", "install"] + pkgs
+            # [fix v3.3.1] brew specs may embed a subcommand, e.g. "--cask love":
+            # passing that as ONE argv element made brew fail with an unknown
+            # option; split every spec on whitespace instead.
+            base = ["brew", "install"]
+            for spec in pkgs:
+                base += spec.split()
         elif mgr == "winget":
             base = ["winget", "install", "--accept-source-agreements",
                     "--accept-package-agreements", "--silent", "--exact"] + pkgs
@@ -774,14 +920,14 @@ class BaseToolInstaller:
             base = ["cpan", "-T"] + pkgs
         else:
             return False
-        info(f"تثبيت {' '.join(pkgs)} عبر {mgr} …")
+        info(f"Installing {' '.join(pkgs)} via {mgr} ...")
         proc = run_cmd(base, timeout=TIMEOUT_PKG)
         if proc.returncode != 0:
-            warn("فشل التثبيت التلقائي — استخدم أمر التثبيت اليدوي أدناه.")
+            warn("Automatic installation failed — use the manual command below.")
         return proc.returncode == 0
 
     def hint(self, packages: Dict[str, Any]) -> str:
-        """أمر تثبيت يدوي واضح — بالمديرات المنطقية لهذا النظام فقط."""
+        """A clear manual install command — only for the sensible managers."""
         system = platform.system()
         order: List[Optional[str]] = [self.manager]
         if system == "Linux":
@@ -815,19 +961,19 @@ class BaseToolInstaller:
                 return "gem install " + " ".join(pkgs)
             if mgr == "cpan":
                 return "cpan -T " + " ".join(pkgs)
-        return "ثبّت الأداة يدويًا من موقعها الرسمي."
+        return "Install the tool manually from its official website."
 
 
-# سجل الحزم لكل أداة: {tool: {manager: pkg([s])}}
+# Package catalog per tool: {tool: {manager: pkg([s])}}
 TOOL_PACKAGES: Dict[str, Dict[str, Any]] = {
     "pyinstaller": {"pip": "pyinstaller"},
     "nuitka": {"pip": "nuitka", "brew": "nuitka"},
     "node": {"apt": ["nodejs", "npm"], "brew": "node",
              "winget": "OpenJS.NodeJS.LTS", "choco": "nodejs-lts"},
-    "npm": {},                                   # مُجمّعة مع node — تُعاد فحصها
-    "npx": {},                                   # مُجمّعة مع node
+    "npm": {},                                   # bundled with node
+    "npx": {},                                   # bundled with node
     "ruby": {"apt": "ruby", "brew": "ruby", "choco": "ruby"},
-    "gem": {},                                   # مُجمّعة مع ruby
+    "gem": {},                                   # bundled with ruby
     "ocra": {"gem": "ocra"},
     "perl": {"apt": "perl", "brew": "perl"},
     "cpan": {},
@@ -868,52 +1014,47 @@ TOOL_PACKAGES: Dict[str, Dict[str, Any]] = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 8) DependencyManager — فحص/تثبيت الأدوات مع cache ومعالجة الأدوات المُجمّعة
+# 8) DependencyManager — check/install tools with cache (no prompts)
 # ═══════════════════════════════════════════════════════════════════════════
 
-# أدوات تُثبَّت ضمن أداة أب (الأب ← الابن)
+# tools installed together with a parent tool (parent -> child)
 BUNDLED_WITH: Dict[str, str] = {"npm": "node", "npx": "node", "gem": "ruby",
                                 "cpan": "perl", "jar": "javac", "jpackage": "javac",
                                 "pp": "perl"}
 
-# أدوات تُستدعى عبر npx بدل تثبيت عالمي
+# tools invoked via npx instead of a global install
 NPX_TOOLS = {"pkg", "electron-builder"}
 
 
 class DependencyManager:
-    def __init__(self, installer: BaseToolInstaller, assume_yes: bool = False,
-                 quick: bool = False, verbose: bool = False):
+    """Checks tools and, only when --auto-install was passed, installs them.
+    [fix] Completely non-interactive: the old TTY prompt is gone — a missing
+    tool either gets installed (flag) or reported with a manual command."""
+
+    def __init__(self, installer: BaseToolInstaller, auto_install: bool = False,
+                 verbose: bool = False):
         self.installer = installer
-        self.assume_yes = assume_yes
-        self.quick = quick
+        self.auto_install = auto_install
         self.verbose = verbose
         self._cache: Dict[str, bool] = {}
 
-    def _may_install(self) -> bool:
-        """التثبيت التلقائي: بموافقة صريحة (-y) أو على TTY تفاعلي.
-        في CI بدون TTY وبدون -y → نكتفي برسالة التثبيت اليدوي (سلوك آمن)."""
-        if not self.installer.available():
-            return False
-        if self.assume_yes:
-            return True
-        try:
-            return sys.stdin.isatty()
-        except Exception:
-            return False
-
     def ensure(self, tool: str, purpose: str = "") -> bool:
-        """ضمان توفر أداة: فحص → تثبيت إن أمكن → [إصلاح حرج] إعادة فحص فعلي
-        (لا افتراض نجاح) → رسالة تثبيت يدوي عند الفشل."""
+        """Ensure *tool* is available: check -> install if asked -> re-check
+        for real (never assume success) -> manual hint on failure."""
         if tool in self._cache:
             return self._cache[tool]
-        if NPX_TOOLS & {tool}:
-            # يعمل عبر npx — يكفي وجود node/npm
-            return self.ensure("node") and self.ensure("npx")
+        if tool in NPX_TOOLS:
+            # runs via npx — node/npm being present is enough
+            # [fix v3.3.1] cache the verdict: the old code re-ran two
+            # subprocess checks on every call (pkg/electron builds slow).
+            found = self.ensure("node") and self.ensure("npx")
+            self._cache[tool] = found
+            return found
         parent = BUNDLED_WITH.get(tool)
         if parent and not which_cmd(tool):
-            # الأداة مُجمّعة مع أب غائب → ثبّت الأب أولًا
+            # the tool is bundled with an absent parent -> install the parent
             self.ensure(parent)
-            # [إصلاح حرج] إعادة فحص الابن بعد الأب — لا نفترض نجاحه
+            # [critical fix] re-check the child after the parent — no assumptions
             found = which_cmd(tool, refresh=True) is not None
             self._cache[tool] = found
             return found
@@ -921,50 +1062,84 @@ class DependencyManager:
             self._cache[tool] = True
             return True
         packages = TOOL_PACKAGES.get(tool, {})
-        ok_install = False
-        if packages and self._may_install():
-            ok_install = self.installer.install(packages)
-            invalidate_tool_cache()           # أي تثبيت يبطّل الكاش كاملًا
+        if packages and self.auto_install and self.installer.available():
+            self.installer.install(packages)
+            invalidate_tool_cache()           # any install invalidates the cache
         found = which_cmd(tool, refresh=True) is not None
         self._cache[tool] = found
         if not found:
-            hint(f"الأداة '{tool}' مطلوبة {'لـ' + purpose if purpose else ''} "
-                 f"وليست مثبتة. التثبيت اليدوي:\n    {self.installer.hint(packages)}")
+            hint(f"Tool '{tool}' is required"
+                 f"{(' for ' + purpose) if purpose else ''} but is not installed.\n"
+                 f"    Manual install: {self.installer.hint(packages)}\n"
+                 f"    Or re-run with --auto-install to install it automatically.")
         return found
 
+    def ensure_python_module(self, module: str, pip_pkg: str, purpose: str = "") -> bool:
+        """[fix] Ensure a Python module (importable) — much more reliable than
+        checking a binary on PATH (the Scripts folder is often missing there)."""
+        key = f"py:{module}"
+        if key in self._cache:
+            return self._cache[key]
+        if self._module_importable(module):
+            self._cache[key] = True
+            return True
+        if self.auto_install and self.installer.available():
+            run_cmd([sys.executable, "-m", "pip", "install", "--quiet", pip_pkg],
+                    timeout=TIMEOUT_PKG)
+            invalidate_tool_cache()
+        found = self._module_importable(module)
+        self._cache[key] = found
+        if not found:
+            hint(f"Python module '{module}' is required"
+                 f"{(' for ' + purpose) if purpose else ''}.\n"
+                 f'    Manual install: "{sys.executable}" -m pip install {pip_pkg}')
+        return found
+
+    def _module_importable(self, module: str) -> bool:
+        try:
+            proc = subprocess.run([sys.executable, "-c", f"import {module}"],
+                                  capture_output=True, timeout=TIMEOUT_SHORT)
+            return proc.returncode == 0
+        except Exception:
+            return False
+
     def require(self, tools: Sequence[str], purpose: str = "") -> None:
-        """مثل ensure لكن يجمّع المفقود ويُفشل البناء برسالة واحدة واضحة."""
+        """Like ensure() but collects everything missing and fails once."""
         missing: List[str] = []
         for t in tools:
             if not self.ensure(t, purpose=purpose):
                 missing.append(t)
         if missing:
-            lines = [f"  - {t} → {self.installer.hint(TOOL_PACKAGES.get(t, {}))}" for t in missing]
-            raise BuildError("أدوات مفقودة لا يمكن الاستمرار بدونها:\n" + "\n".join(lines))
+            lines = [f"  - {t} -> {self.installer.hint(TOOL_PACKAGES.get(t, {}))}"
+                     for t in missing]
+            raise BuildError("Required tools are missing:\n" + "\n".join(lines))
 
     def reset_cache(self) -> None:
         self._cache.clear()
 
     def check_all(self) -> int:
-        """--check-tools: جدول حالة كل الأدوات المعروفة."""
+        """--check-tools: status table of every known tool."""
         catalog = [
-            ("python", "مفسّر Python 3.9+ (مطلوب)"),
-            ("pyinstaller", "بناء Python — PyInstaller"),
-            ("nuitka", "بناء Python — Nuitka (اختياري)"),
-            ("node", "منصة Node.js"), ("npm", "مدير حزم Node"),
-            ("ruby", "مفسّر Ruby"), ("ocra", "تغليف Ruby (Windows)"),
-            ("perl", "مفسّر Perl"), ("pp", "PAR::Packer لـ Perl"),
-            ("love", "محرك LÖVE (Lua)"),
-            ("gcc", "مترجم C"), ("g++", "مترجم C++"), ("cmake", "نظام بناء CMake"),
-            ("make", "GNU Make"), ("x86_64-w64-mingw32-gcc", "MinGW للـ cross إلى Windows"),
-            ("cargo", "Rust — Cargo"), ("rustup", "مدير أدوات Rust"),
-            ("go", "مترجم Go"), ("nim", "مترجم Nim"), ("zig", "مترجم Zig"),
-            ("crystal", "مترجم Crystal"), ("dotnet", ".NET SDK"),
-            ("java", "Java Runtime"), ("javac", "مترجم Java"), ("jar", "أداة JAR"),
-            ("jpackage", "تغليف Java أصلي"), ("mvn", "Maven"), ("gradle", "Gradle"),
-            ("kotlinc", "مترجم Kotlin"), ("scala-cli", "Scala CLI"), ("sbt", "Scala Build Tool"),
+            ("python", "Python 3.9+ interpreter (required)"),
+            ("pyinstaller", "Python builds — PyInstaller"),
+            ("nuitka", "Python builds — Nuitka (optional)"),
+            ("node", "Node.js runtime"), ("npm", "Node package manager"),
+            ("npx", "Node package runner"),
+            ("ruby", "Ruby interpreter"), ("ocra", "Ruby packaging (Windows)"),
+            ("perl", "Perl interpreter"), ("pp", "PAR::Packer for Perl"),
+            ("love", "LÖVE engine (Lua)"),
+            ("gcc", "C compiler"), ("g++", "C++ compiler"),
+            ("cmake", "CMake build system"), ("make", "GNU Make"),
+            ("x86_64-w64-mingw32-gcc", "MinGW cross-compiler (-> Windows)"),
+            ("cargo", "Rust — Cargo"), ("rustup", "Rust toolchain manager"),
+            ("go", "Go compiler"), ("nim", "Nim compiler"), ("zig", "Zig compiler"),
+            ("crystal", "Crystal compiler"), ("dotnet", ".NET SDK"),
+            ("java", "Java runtime"), ("javac", "Java compiler"),
+            ("jar", "JAR tool"), ("jpackage", "Native Java packaging"),
+            ("mvn", "Maven"), ("gradle", "Gradle"),
+            ("kotlinc", "Kotlin compiler"), ("scala-cli", "Scala CLI"),
             ("flutter", "Flutter SDK"), ("dart", "Dart SDK"),
-            ("godot", "محرك Godot"),
+            ("godot", "Godot engine"),
         ]
         rows = []
         missing = 0
@@ -975,62 +1150,62 @@ class DependencyManager:
                 found = True
             if not found:
                 missing += 1
-            rows.append((("✓ " if found else "✗ ") + tool, label))
-        render_box(f"حالة الأدوات ({len(catalog) - missing}/{len(catalog)} متوفرة)", rows, width=72)
+            rows.append(((SYM["ok"] + " " if found else SYM["err"] + " ") + tool, label))
+        render_box(f"Tool status ({len(catalog) - missing}/{len(catalog)} available)",
+                   rows, width=72)
         if missing:
-            hint("ثبّت ما يلزم لمشاريعك فقط — ليست كل الأدوات ضرورية لكل لغة.")
+            hint("Install only what your projects need — not every tool is required for every language.")
         return 0
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 9) ProjectDetector — كشف لغة المشروع بنظام نقاط (Confidence Score)
+# 9) ProjectDetector — language detection via a confidence-score system
 # ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class Rule:
     lang: LangType
-    weight: int                    # نقاط عالية لملفات البناء، متوسطة للمصادر
-    names: Tuple[str, ...]         # أسماء ملفات دقيقة أو امتدادات ".py"
+    weight: int                    # high for build files, medium for sources
+    names: Tuple[str, ...]         # exact file names or extensions ".py"
     kind: str = "file"             # file | ext | dir
-    label: str = ""                # وصف الدليل
+    label: str = ""                # evidence description
 
 
-# قواعد الملفات/المجلدات — نقاط عالية (ملفات البناء أقوى دليل)
 _BUILD_RULES: List[Rule] = [
-    Rule(LangType.PYTHON, 40, ("setup.py", "setup.cfg"), label="ملف تثبيت Python"),
-    Rule(LangType.PYTHON, 35, ("pyproject.toml", "requirements.txt", "Pipfile"), label="ملف تبعيات Python"),
-    Rule(LangType.PYTHON, 30, ("main.py", "app.py", "run.py", "cli.py", "__main__.py"), label="نقطة دخول Python"),
+    Rule(LangType.PYTHON, 40, ("setup.py", "setup.cfg"), label="Python packaging file"),
+    Rule(LangType.PYTHON, 35, ("pyproject.toml", "requirements.txt", "Pipfile"), label="Python dependency file"),
+    Rule(LangType.PYTHON, 30, ("main.py", "app.py", "run.py", "cli.py", "__main__.py"), label="Python entry point"),
     Rule(LangType.NODE, 45, ("package.json",), label="package.json"),
-    Rule(LangType.ELECTRON, 65, ("package.json",), label="package.json مع اعتماد electron"),
+    Rule(LangType.ELECTRON, 65, ("package.json",), label="package.json with an electron dependency"),
     Rule(LangType.RUST, 60, ("Cargo.toml",), label="Cargo.toml"),
     Rule(LangType.GO, 60, ("go.mod",), label="go.mod"),
     Rule(LangType.CPP, 50, ("CMakeLists.txt",), label="CMakeLists.txt"),
     Rule(LangType.CPP, 30, ("Makefile", "makefile", "GNUmakefile"), label="Makefile"),
-    Rule(LangType.NIM, 60, ("main.nim", "app.nim"), label="نقطة دخول Nim"),
+    Rule(LangType.NIM, 60, ("main.nim", "app.nim"), label="Nim entry point"),
     Rule(LangType.ZIG, 60, ("build.zig",), label="build.zig"),
     Rule(LangType.CRYSTAL, 60, ("shard.yml",), label="shard.yml"),
-    Rule(LangType.DOTNET, 60, (".csproj", ".vbproj", ".fsproj"), kind="ext", label="مشروع .NET"),
-    Rule(LangType.DOTNET, 55, (".sln",), kind="ext", label="حل .NET"),
+    Rule(LangType.DOTNET, 60, (".csproj", ".vbproj", ".fsproj"), kind="ext", label=".NET project"),
+    Rule(LangType.DOTNET, 55, (".sln",), kind="ext", label=".NET solution"),
     Rule(LangType.JAVA, 55, ("pom.xml",), label="Maven pom.xml"),
-    Rule(LangType.JAVA, 40, ("build.gradle", "build.gradle.kts"), label="Gradle build"),
+    Rule(LangType.JAVA, 40, ("build.gradle", "build.gradle.kts"), label="Gradle build script"),
     Rule(LangType.JAVA, 25, ("gradlew", "gradlew.bat"), label="Gradle wrapper"),
     Rule(LangType.ANDROID, 65, ("AndroidManifest.xml",), label="AndroidManifest.xml"),
     Rule(LangType.KOTLIN, 45, ("build.gradle.kts",), label="Gradle Kotlin DSL"),
     Rule(LangType.SCALA, 60, ("build.sbt",), label="build.sbt"),
-    Rule(LangType.FLUTTER, 60, ("pubspec.yaml",), label="pubspec.yaml"),   # يُنفّص محتواه لاحقًا
+    Rule(LangType.FLUTTER, 60, ("pubspec.yaml",), label="pubspec.yaml"),   # content-checked later
     Rule(LangType.DART, 40, ("pubspec.yaml",), label="pubspec.yaml"),
     Rule(LangType.RUBY, 40, ("Gemfile",), label="Gemfile"),
-    Rule(LangType.PERL, 35, ("Makefile.PL", "Build.PL"), label="بناء Perl"),
+    Rule(LangType.PERL, 35, ("Makefile.PL", "Build.PL"), label="Perl build script"),
     Rule(LangType.LUA, 35, ("main.lua",), label="main.lua"),
-    Rule(LangType.LOVE, 55, ("conf.lua",), label="مشروع LÖVE (conf.lua)"),
+    Rule(LangType.LOVE, 55, ("conf.lua",), label="LÖVE project (conf.lua)"),
     Rule(LangType.GODOT, 70, ("project.godot",), label="project.godot"),
-    Rule(LangType.UNREAL, 75, (".uproject",), kind="ext", label="ملف Unreal"),
-    Rule(LangType.GAMEMAKER, 70, (".yyp", ".project.gmx"), kind="ext", label="مشروع GameMaker"),
-    Rule(LangType.RENPY, 65, ("options.rpy", "script.rpy"), label="سكربت Ren'Py"),
+    Rule(LangType.UNREAL, 75, (".uproject",), kind="ext", label="Unreal project file"),
+    Rule(LangType.GAMEMAKER, 70, (".yyp", ".project.gmx"), kind="ext", label="GameMaker project"),
+    Rule(LangType.RENPY, 65, ("options.rpy", "script.rpy"), label="Ren'Py script"),
 ]
 
-# قواعد الامتدادات — نقاط متوسطة (ملفات المصدر)
+# extension rules — medium scores (source files)
 _SRC_RULES: List[Tuple[LangType, int, int, Tuple[str, ...]]] = [
-    # (اللغة، نقاط أول ملف، نقاط لكل ملف إضافي حتى السقف، الامتدادات)
+    # (language, first-file points, per-extra-file points (capped), extensions)
     (LangType.PYTHON, 20, 3, (".py",)),
     (LangType.NODE, 12, 3, (".js", ".mjs", ".cjs", ".ts")),
     (LangType.RUST, 25, 5, (".rs",)),
@@ -1052,8 +1227,16 @@ _SRC_RULES: List[Tuple[LangType, int, int, Tuple[str, ...]]] = [
 
 
 class ProjectDetector:
-    """نظام نقاط: ملفات البناء نقاط عالية، المصادر متوسطة، المجلدات الدالة عالية.
-    عند التعادل يفوز الأعلى نقاطًا؛ عند فشل كامل → UNKNOWN مع نصيحة --lang."""
+    """Score system: build files score high, sources medium, marker dirs high.
+    Ties go to the highest score; a total failure -> UNKNOWN with a --lang hint.
+
+    [fix] Entry-point detection was rewritten:
+      * candidates ranked by depth (shallowest wins), not scan order;
+      * marker-based fallback ('if __name__ == "__main__"', 'int main(',
+        'fun main(', 'package main', ...) finds entries name lists miss;
+      * Rust / .NET / Flutter / Godot / Kotlin / Scala entries are handled;
+      * 'main' from package.json is normalized and verified on disk.
+    """
 
     THRESHOLD = 12
 
@@ -1069,8 +1252,8 @@ class ProjectDetector:
         except OSError:
             self.top_dirs = set()
 
-    # ---------- قواعد خاصة بالمحتوى ----------
-    def _package_json_flags(self) -> Dict[str, bool]:
+    # ---------- content-specific rules ----------
+    def _package_json_flags(self) -> Dict[str, Any]:
         pj = next((f for f in self.files if f.name == "package.json"), None)
         if not pj:
             return {}
@@ -1099,7 +1282,7 @@ class ProjectDetector:
         game = self.project / "game"
         return game.is_dir() and any(game.glob("*.rpy"))
 
-    # ---------- التنفيذ ----------
+    # ---------- main detection ----------
     def detect(self) -> DetectedProject:
         det = DetectedProject()
         if not self.project.is_dir():
@@ -1113,14 +1296,15 @@ class ProjectDetector:
             evidence.setdefault(lang, []).append(f"{why} (+{pts})")
 
         rel = rel_files(self.files, self.project)
+        flags = self._package_json_flags()
 
-        # 1) ملفات البناء — نقاط عالية (لكل قاعدة مرة واحدة)
+        # 1) build files — high scores (each rule counted once)
         for rule in _BUILD_RULES:
             if rule.lang is LangType.FLUTTER and not self._pubspec_is_flutter():
                 continue
             if rule.lang is LangType.DART and self._pubspec_is_flutter():
                 continue
-            if rule.lang is LangType.ELECTRON and not self._package_json_flags().get("electron"):
+            if rule.lang is LangType.ELECTRON and not flags.get("electron"):
                 continue
             hits = 0
             for f in rel:
@@ -1133,23 +1317,22 @@ class ProjectDetector:
             if hits:
                 add(rule.lang, rule.weight, rule.label or rule.names[0])
 
-        # 2) قاعدة Unity (مجلدات Assets + ProjectSettings) — نقاط عالية
+        # 2) directory-based rules — high scores
         if self._unity_like():
-            add(LangType.UNITY, 75, "مجلدا Assets + ProjectSettings")
+            add(LangType.UNITY, 75, "Assets + ProjectSettings directories")
         if self._renpy_like():
-            add(LangType.RENPY, 55, "مجلد game/ مع سكربتات .rpy")
+            add(LangType.RENPY, 55, "game/ folder containing .rpy scripts")
 
-        # 3) مصادر — نقاط متوسطة مع سقف لكل لغة
+        # 3) sources — medium scores, capped per language
         for lang, first, per, exts in _SRC_RULES:
             count = sum(1 for f in rel if f.suffix.lower() in exts)
             if count:
                 pts = first + min(count - 1, 5) * per
-                add(lang, pts, f"{count} ملف {exts[0]}")
+                add(lang, pts, f"{count} file(s) {exts[0]}")
 
-        # 4) تحسينات فصل الحالات المتقاربة
-        flags = self._package_json_flags()
+        # 4) tie-breakers for close cases
         if flags.get("electron"):
-            add(LangType.ELECTRON, 20, "اعتماد electron في package.json")
+            add(LangType.ELECTRON, 20, "electron dependency in package.json")
         self._refine_gradle_family(add)
         self._refine_c_family(add)
 
@@ -1159,14 +1342,15 @@ class ProjectDetector:
         det.lang, det.score = best[0], best[1]
         det.confidence = min(1.0, det.score / 80.0)
         det.evidence = evidence.get(det.lang, [])
-        det.project_name = self._guess_name(flags.get("name") or "")
+        det.project_name = self.guess_name(flags.get("name") or "")
         det.entry_point = self.detect_entry(det.lang)
         if det.score < self.THRESHOLD:
-            det.lang, det.confidence, det.score = LangType.UNKNOWN, 0.0, det.score
+            # [fix] clear the entry point too — it belonged to a rejected guess
+            det.lang, det.confidence, det.entry_point = LangType.UNKNOWN, 0.0, None
         return det
 
     def _refine_gradle_family(self, add: Callable[[LangType, int, str], None]) -> None:
-        """Gradle بلا Manifest = جافا/كوتلن/سكالا — يفوز الأكثر ملفات مصدر."""
+        """Gradle without a manifest = Java/Kotlin/Scala — most sources win."""
         has_gradle = any(f.name.startswith("build.gradle") for f in self.files)
         has_manifest = any(f.name == "AndroidManifest.xml" for f in self.files)
         if not has_gradle or has_manifest:
@@ -1177,1221 +1361,1252 @@ class ProjectDetector:
                                  (LangType.JAVA, (".java",)))}
         best = max(counts.items(), key=lambda kv: kv[1])
         if best[1] > 0:
-            add(best[0], 25, f"Gradle + {best[1]} ملف {best[0].value}")
+            add(best[0], 25, f"Gradle + {best[1]} {best[0].value} file(s)")
 
     def _refine_c_family(self, add: Callable[[LangType, int, str], None]) -> None:
-        """CMake/Make بلا تحديد: يقارن مصادر .c مقابل .cpp ليختار C أو C++."""
+        """CMake/Make without a hint: compare .c vs .cpp sources to pick C or C++."""
         rel = rel_files(self.files, self.project)
         c_n = sum(1 for f in rel if f.suffix in (".c",))
         cpp_n = sum(1 for f in rel if f.suffix in (".cpp", ".cc", ".cxx"))
         if c_n and cpp_n:
-            add(LangType.CPP, 10, f"مزيج C/C++ (cpp: {cpp_n}, c: {c_n})")
+            add(LangType.CPP, 10, f"mixed C/C++ (cpp: {cpp_n}, c: {c_n})")
         elif c_n:
-            add(LangType.C, 15, f"{c_n} ملف .c")
+            add(LangType.C, 15, f"{c_n} .c file(s)")
         elif cpp_n:
-            add(LangType.CPP, 15, f"{cpp_n} ملف .cpp")
+            add(LangType.CPP, 15, f"{cpp_n} .cpp file(s)")
 
-    def _guess_name(self, fallback: str = "") -> str:
+    def guess_name(self, fallback: str = "") -> str:
+        """Best-effort project name (package.json / godot / pubspec / cargo / folder).
+        [fix] The Cargo name is now read from the [package] section only."""
         if fallback:
             return fallback
-        # Godot?  Cargo?  وإلا اسم المجلد
-        godot = self.project / "project.godot"
-        name = regex_first(read_small_text(godot), r'config/name\s*=\s*"([^"]+)"')
+        pj = next((f for f in self.files if f.name == "package.json"), None)
+        if pj:
+            n = parse_json_file(pj).get("name")
+            if isinstance(n, str) and n:
+                return n
+        name = regex_first(read_small_text(self.project / "project.godot"),
+                           r'config/name\s*=\s*"([^"]+)"')
         if name:
             return name
+        ps = self.project / "pubspec.yaml"
+        if ps.exists():
+            name = regex_first(read_small_text(ps), r"^name:\s*(\S+)")
+            if name:
+                return name
         cargo = self.project / "Cargo.toml"
-        name = regex_first(read_small_text(cargo), r'^\s*name\s*=\s*"([^"]+)"')
-        if name:
-            return name
-        return sanitize_name(self.project.resolve().name)
+        if cargo.exists():
+            m = re.search(r'\[package\][^\[]*?^\s*name\s*=\s*"([^"]+)"',
+                          read_small_text(cargo), re.S | re.M)
+            if m:
+                return m.group(1)
+        return sanitize_name(self.project.name)
 
-    # ---------- نقطة الدخول لكل لغة ----------
+    # ---------------- entry-point detection (rewritten) ----------------
     def detect_entry(self, lang: LangType) -> Optional[str]:
+        """Best-effort entry-point detection.
+        Returns a path relative to the project root (POSIX separators) or None."""
         if not self.files:
-            # [إصلاح] يُستدعى أحيانًا قبل detect() من داخل البنّائين — امسح أولًا
+            # may be called before detect() from builders — scan first
             self._scan()
         rel = rel_files(self.files, self.project)
-        names = {f.name: f for f in rel}
-        root_files = [f for f in rel if len(f.parts) == 1]
+        rel_posix = {f.as_posix(): f for f in rel}
 
-        def first_existing(cands: Sequence[str]) -> Optional[str]:
+        def by_path(cands: Sequence[str]) -> Optional[str]:
             for c in cands:
-                if c in names:
-                    return str(names[c])
+                if c in rel_posix:
+                    return c
+            return None
+
+        def by_name(names: Sequence[str]) -> Optional[str]:
+            wanted = {n.lower() for n in names}
+            best: Optional[Path] = None
+            for f in rel:
+                if f.name.lower() in wanted:
+                    if best is None or len(f.parts) < len(best.parts):
+                        best = f
+            return best.as_posix() if best else None
+
+        def by_marker(suffixes: Sequence[str], markers: Sequence[str],
+                      limit: int = 400) -> Optional[str]:
+            ordered = sorted(rel, key=lambda p: (len(p.parts), p.as_posix()))
+            for f in ordered[:limit]:
+                if f.suffix.lower() in suffixes:
+                    text = read_small_text(self.project / f, 262144)
+                    if any(m in text for m in markers):
+                        return f.as_posix()
             return None
 
         if lang is LangType.PYTHON:
-            entry = first_existing(("main.py", "app.py", "run.py", "cli.py", "__main__.py"))
+            entry = by_path(("main.py", "app.py", "run.py", "cli.py",
+                             "__main__.py", "src/main.py", "src/app.py"))
             if entry:
                 return entry
-            pys = [f for f in root_files if f.suffix == ".py" and f.name != "setup.py"]
-            return str(pys[0]) if len(pys) == 1 else None
+            # [fix] disambiguate several .py files via the __main__ guard
+            entry = by_marker((".py",), ('if __name__ == "__main__"'))
+            if entry:
+                return entry
+            roots = [f for f in rel if len(f.parts) == 1
+                     and f.suffix == ".py" and f.name != "setup.py"]
+            return roots[0].as_posix() if len(roots) == 1 else None
+
         if lang in (LangType.NODE, LangType.ELECTRON):
-            main = self._package_json_flags().get("main")
+            # [fix] normalize 'main' (backslashes, ./) and verify on disk
+            main = (self._package_json_flags().get("main") or "").replace("\\", "/")
+            while main.startswith("./"):
+                main = main[2:]
             if main and (self.project / main).exists():
                 return main
-            return first_existing(("index.js", "main.js", "app.js", "src/index.js", "src/main.js"))
-        if lang is LangType.GO:
-            return first_existing(("main.go", "cmd/main.go", "src/main.go"))
-        if lang is LangType.CPP:
-            return first_existing(("main.cpp", "src/main.cpp", "src/main.cc"))
-        if lang is LangType.C:
-            return first_existing(("main.c", "src/main.c"))
-        if lang is LangType.NIM:
-            return first_existing(("main.nim", "src/main.nim", "app.nim"))
-        if lang is LangType.ZIG:
-            return first_existing(("main.zig", "src/main.zig"))
-        if lang is LangType.CRYSTAL:
-            return first_existing(("src/main.cr", "main.cr"))
-        if lang is LangType.DART:
-            return first_existing(("bin/main.dart", "main.dart", "lib/main.dart"))
-        if lang is LangType.LUA or lang is LangType.LOVE:
-            return first_existing(("main.lua", "src/main.lua"))
-        if lang is LangType.RUBY:
-            return first_existing(("main.rb", "app.rb", "bin/main.rb"))
-        if lang is LangType.PERL:
-            return first_existing(("main.pl", "app.pl", "script.pl"))
-        if lang in (LangType.JAVA, LangType.KOTLIN, LangType.SCALA):
-            # بحث محدود عن ملف يحتوي main — أداء آمن بسقوف
-            markers = {"java": "static void main", "kotlin": "fun main",
-                       "scala": "def main"}[lang.value]
-            for f in self.files[:400]:
-                if f.suffix in (".java", ".kt", ".scala") and markers in read_small_text(f, 65536):
-                    try:
-                        return str(f.relative_to(self.project))
-                    except ValueError:
-                        continue
+            entry = by_path(("index.js", "main.js", "app.js", "server.js",
+                             "src/index.js", "src/main.js", "src/app.js",
+                             "index.ts", "src/index.ts", "electron/main.js"))
+            if entry:
+                return entry
+            return by_marker((".js", ".mjs", ".cjs"), ("require(", "import "))
+
+        if lang is LangType.RUST:                      # [fix] was missing entirely
+            entry = by_path(("src/main.rs", "main.rs", "src/bin/main.rs"))
+            if entry:
+                return entry
+            m = re.search(r'\[\[bin\]\].*?path\s*=\s*"([^"]+)"',
+                          read_small_text(self.project / "Cargo.toml"), re.S)
+            if m and (self.project / m.group(1)).exists():
+                return m.group(1)
             return None
+
+        if lang is LangType.GO:
+            entry = by_path(("main.go", "cmd/main.go", "src/main.go"))
+            return entry or by_marker((".go",), ("package main",))
+
+        if lang is LangType.C:
+            entry = by_path(("main.c", "src/main.c"))
+            return entry or by_marker((".c",), ("int main(", "int main (", "void main("))
+
+        if lang is LangType.CPP:
+            entry = by_path(("main.cpp", "src/main.cpp", "main.cc", "src/main.cc"))
+            return entry or by_marker((".cpp", ".cc", ".cxx"),
+                                      ("int main(", "int main ("))
+
+        if lang is LangType.NIM:
+            entry = by_path(("main.nim", "src/main.nim", "app.nim"))
+            if entry:
+                return entry
+            roots = [f for f in rel if len(f.parts) == 1 and f.suffix == ".nim"]
+            return roots[0].as_posix() if len(roots) == 1 else None
+
+        if lang is LangType.ZIG:
+            return by_path(("main.zig", "src/main.zig"))
+
+        if lang is LangType.CRYSTAL:
+            entry = by_path(("src/main.cr", "main.cr"))
+            return entry or by_marker((".cr",), ("def main",))
+
+        if lang is LangType.DOTNET:                    # [fix] was missing entirely
+            proj = sorted((f for f in rel
+                           if f.suffix in (".csproj", ".vbproj", ".fsproj")),
+                          key=lambda p: (len(p.parts), p.as_posix()))
+            return proj[0].as_posix() if proj else None
+
+        # [fix] the Java/Kotlin/Scala block was truncated in the old version
+        if lang is LangType.JAVA:
+            return by_marker((".java",), ("static void main",))
+
+        if lang is LangType.KOTLIN:
+            return by_marker((".kt",), ("fun main(",))
+
+        if lang is LangType.SCALA:
+            return by_marker((".scala", ".sc"), ("def main(", "extends App"))
+
+        if lang is LangType.FLUTTER:
+            return by_path(("lib/main.dart", "main.dart"))
+
+        if lang is LangType.DART:
+            bins = sorted((f for f in rel if len(f.parts) == 2
+                           and f.parts[0] == "bin" and f.suffix == ".dart"),
+                          key=lambda p: p.as_posix())
+            if bins:
+                return bins[0].as_posix()
+            entry = by_path(("main.dart", "bin/main.dart"))
+            if entry:
+                return entry
+            return by_marker((".dart",), ("void main(", "Future<void> main("))
+
+        if lang is LangType.LOVE:
+            return by_path(("main.lua", "src/main.lua", "conf.lua"))
+
+        if lang is LangType.LUA:
+            return by_path(("main.lua", "src/main.lua"))
+
+        if lang is LangType.RUBY:
+            entry = by_path(("main.rb", "app.rb", "bin/main.rb", "exe/app.rb"))
+            if entry:
+                return entry
+            roots = [f for f in rel if len(f.parts) == 1 and f.suffix == ".rb"]
+            return roots[0].as_posix() if len(roots) == 1 else None
+
+        if lang is LangType.PERL:
+            entry = by_path(("main.pl", "app.pl", "script.pl", "bin/app.pl"))
+            if entry:
+                return entry
+            roots = [f for f in rel if len(f.parts) == 1 and f.suffix == ".pl"]
+            return roots[0].as_posix() if len(roots) == 1 else None
+
+        if lang is LangType.GODOT:
+            return by_path(("project.godot",))
+
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 10) BaseBuilder — الواجهة الموحّدة لكل البناؤين
+# 10) Build configuration + builder framework
 # ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class BuildConfig:
+    project: Path
+    name: str
+    onefile: bool
+    noconsole: bool
+    target_os: str            # resolved: windows | linux | macos | android
+    entry: Optional[str]      # relative (POSIX) path or None
+    output_dir: Path
+    verbose: bool = False
+    engine: str = "pyinstaller"
+    icon: Optional[Path] = None                              # [new] --icon
+    add_data: List[Tuple[Path, str]] = field(default_factory=list)  # [new] --add-data
+    backend: str = "auto"                                    # [toolbox compat] --backend
+    hidden_imports: List[str] = field(default_factory=list)  # [toolbox compat] --hidden-import
+    backend: str = "auto"                                    # [toolbox compat] --backend
+    hidden_imports: List[str] = field(default_factory=list)  # [toolbox compat] --hidden-import
+
+    @property
+    def host_os(self) -> str:
+        return current_os()
+
+    @property
+    def crossing(self) -> bool:
+        return self.target_os != self.host_os
+
+    def entry_path(self) -> Optional[Path]:
+        if not self.entry:
+            return None
+        return self.project / self.entry
+
+    def need_entry(self) -> Path:
+        p = self.entry_path()
+        if p is None or not p.exists():
+            raise BuildError(
+                "No entry point available for this build.\n"
+                "Specify one explicitly:  --entry <relative/path/to/file>")
+        return p
+
+
+def pick_binary(arts: List[Path], cfg: BuildConfig) -> Path:
+    """Pick the most plausible binary from a list of candidates."""
+    stems = {cfg.name.lower(), "main", "app"}
+    if cfg.entry:
+        stems.add(Path(cfg.entry).stem.lower())
+    for p in arts:
+        if p.stem.lower() in stems:
+            return p
+    return max(arts, key=lambda p: p.stat().st_size)
+
 
 class BaseBuilder:
-    """كل Builder يطبّق نفس الواجهة:
-      build()        → مسار الملف الناتج
-      _require()     → فحص/تثبيت الأدوات المطلوبة
-      _run()         → تنفيذ subprocess مع timeout
-      _print_result()→ طباعة موحّدة
-    """
-
     LANG = LangType.UNKNOWN
-    TITLE = "?"       # اسم الأداة المستخدمة للعرض في الملخص
+    TOOL_LABEL = "?"
+    # [toolbox compat] backend names this builder can actually honor
+    SUPPORTED_BACKENDS: Tuple[str, ...] = ()
 
-    def __init__(self, opts: argparse.Namespace, deps: DependencyManager):
-        self.opts = opts
+    def __init__(self, cfg: BuildConfig, deps: DependencyManager):
+        self.cfg = cfg
         self.deps = deps
-        self.t0 = time.monotonic()
-        self.project: Path = Path(opts.project).expanduser().resolve()
-        self.target_os: str = resolve_target_os(getattr(opts, "target_os", "native"))
-        self.out: Path = self._resolve_out()
-        self.name: str = sanitize_name(getattr(opts, "name", "") or self.project.name)
-        self.entry: Optional[str] = getattr(opts, "script", None) or None
-        self.icon: Optional[str] = getattr(opts, "icon", None) or None
-        self._tmp_dirs: List[Path] = []
-
-    # ---------- إعداد المسارات ----------
-    def _resolve_out(self) -> Path:
-        out = Path(getattr(self.opts, "output", "") or DEFAULT_OUTPUT_DIR)
-        if not out.is_absolute():
-            out = Path(self.opts.project).expanduser().resolve() / out
-        return out
-
-    def _ensure_out(self) -> None:
+        self.project = cfg.project
+        self.out = cfg.output_dir
         self.out.mkdir(parents=True, exist_ok=True)
 
-    def _tmp(self, label: str) -> Path:
-        """مجلد عمل مؤقت داخل المشروع — يُنظّف دائمًا في finally."""
-        d = self.project / ".polybuild_tmp" / label
-        d.mkdir(parents=True, exist_ok=True)
-        self._tmp_dirs.append(d)
-        return d
+    def build(self) -> List[Path]:
+        raise NotImplementedError
 
-    def _cleanup(self) -> None:
-        # [إصلاح] تنظيف ملفات مؤقتة دائمًا — ولا كتابة خارج المشروع/dist أصلًا
-        for d in self._tmp_dirs:
-            shutil.rmtree(d, ignore_errors=True)
+    # ---- shared helpers ----
+    def check_features(self, icon: bool = False, data: bool = False,
+                       hidden: bool = False) -> None:
+        """[new] Warn clearly when --icon/--add-data/--hidden-import cannot be
+        consumed by the chosen toolchain — the build itself continues unaffected."""
+        if self.cfg.icon and not icon:
+            warn(f"--icon is not applicable to {self.TOOL_LABEL} — ignored.")
+        if self.cfg.add_data and not data:
+            warn(f"--add-data is not applicable to {self.TOOL_LABEL} — ignored.")
+        if self.cfg.hidden_imports and not hidden:
+            warn(f"--hidden-import is not applicable to {self.TOOL_LABEL} — ignored.")
 
-    # ---------- النقاط الأساسية ----------
-    def _require(self, tools: Sequence[str], purpose: str = "") -> None:
-        self.deps.require(tools, purpose=purpose or self.LANG.value)
+    def check_backend(self) -> None:
+        """[toolbox compat] One clear warning when the requested --backend is
+        not something this builder can honor — the default backend is used."""
+        b = (getattr(self.cfg, "backend", "") or "").strip().lower()
+        if b in ("", "auto", "-"):
+            return
+        if b not in self.SUPPORTED_BACKENDS:
+            want = ", ".join(self.SUPPORTED_BACKENDS) or "(none)"
+            warn(f"--backend {b} is not supported by {self.TOOL_LABEL} "
+                 f"(supported: {want}) — using the default backend.")
 
-    def _run(self, cmd: Sequence[str], cwd: Optional[Path] = None,
-             timeout: int = TIMEOUT_LONG, env: Optional[Dict[str, str]] = None,
-             fatal: bool = True) -> subprocess.CompletedProcess:
-        if self.opts.verbose:
-            dim("    $ " + " ".join(str(c) for c in cmd))
+    def run(self, cmd: Sequence[str], cwd: Optional[Path] = None,
+            timeout: int = TIMEOUT_LONG,
+            env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
         proc = run_cmd(cmd, cwd=cwd or self.project, timeout=timeout, env=env)
-        if fatal and proc.returncode != 0:
-            details = tail_lines((proc.stderr or "") + "\n" + (proc.stdout or ""), 8)
-            raise BuildError(
-                f"أمر البناء فشل (رمز {proc.returncode}):\n    $ {' '.join(str(c) for c in cmd)[:300]}\n"
-                + (f"  تفاصيل الخطأ:\n{details}" if details else "  (لا مخرجات من الأداة)"))
+        if proc.returncode != 0:
+            tail = tail_lines((proc.stdout or "") + "\n" + (proc.stderr or ""), 8)
+            raise BuildError(f"Command failed: {cmd[0]} (exit={proc.returncode})\n{tail}")
+        if self.cfg.verbose and (proc.stdout or proc.stderr):
+            dim(((proc.stdout or "") + (proc.stderr or "")).strip())
         return proc
 
-    def _print_result(self, path: Path) -> None:
-        ok("البناء اكتمل: " + str(path))
-
-    def _artifact(self, *cands: Path) -> Optional[Path]:
-        for c in cands:
-            if c and Path(c).exists():
-                return Path(c)
-        return None
-
-    def _find_executable(self, folder: Path) -> Optional[Path]:
-        """أحدث ملف تنفيذي داخل مجلد (لنتائج cmake/make ...)."""
-        if folder.is_file():
-            return folder
-        ext = exe_ext(self.target_os)
-        best: Optional[Path] = None
-        best_t = -1.0
-        for f in folder.rglob("*" + ext) if folder.exists() else []:
-            if not f.is_file():
+    def emit(self, paths: Iterable[Path]) -> List[Path]:
+        """Verify that artifacts exist and are non-empty; return them."""
+        arts: List[Path] = []
+        for p in paths:
+            p = Path(p)
+            try:
+                if p.is_dir():
+                    if any(p.iterdir()):
+                        arts.append(p)
+                elif p.exists() and p.stat().st_size > 0:
+                    arts.append(p)
+            except OSError:
                 continue
-            if ext == "" and not (os.access(f, os.X_OK) or f.suffix in ("", ".bin", ".run")):
-                continue
-            if f.parent.name in EXCLUDE_DIRS:
-                continue
-            t = f.stat().st_mtime
-            if t > best_t:
-                best, best_t = f, t
-        return best
+        if not arts:
+            raise BuildError("The build reported success but produced no artifacts.")
+        return arts
 
-    def _copy_into(self, src: Path, dst_dir: Path) -> Path:
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        dst = dst_dir / src.name
+    def copy_to_out(self, src: Path, name: Optional[str] = None) -> Path:
+        dst = self.out / (name or src.name)
         if src.is_dir():
             if dst.exists():
-                shutil.rmtree(dst)
+                shutil.rmtree(dst, ignore_errors=True)
             shutil.copytree(src, dst)
         else:
             shutil.copy2(src, dst)
         return dst
 
-    # ---------- خطافات اختيارية للبنّائين ----------
-    def _update_project_deps(self) -> None:
-        """--update-deps: يُنفّذ داخل كل Builder إن كان له مدير تبعيات."""
-
-    # ---------- القالب العام للبناء ----------
-    def build(self) -> Path:
-        self.t0 = time.monotonic()
-        try:
-            if not self.project.is_dir():
-                raise BuildError(f"مجلد المشروع غير موجود: {self.project}")
-            if self.opts.update_deps:
-                info("تحديث تبعيات المشروع …")
-                self._update_project_deps()
-            self._ensure_out()
-            path = self._compile()
-            if not path or not Path(path).exists():
-                raise BuildError("لم يُنتج البناء أي ملف — راجع مخرجات الأداة أعلاه.")
-            self._print_result(Path(path))
-            return Path(path)
-        finally:
-            self._cleanup()
-
-    def _compile(self) -> Path:
-        raise NotImplementedError
-
 # ═══════════════════════════════════════════════════════════════════════════
-# 11) البنّاؤون — المفسّرة/السكربتية
+# 11) Builders — one per language/environment
 # ═══════════════════════════════════════════════════════════════════════════
 
 class PythonBuilder(BaseBuilder):
-    """Python عبر PyInstaller أو Nuitka — backend: auto / pyinstaller / nuitka."""
     LANG = LangType.PYTHON
-    TITLE = "PyInstaller"
+    TOOL_LABEL = "PyInstaller / Nuitka"
+    SUPPORTED_BACKENDS = ("pyinstaller", "nuitka", "cx_freeze")
 
-    def _pick_backend(self) -> str:
-        backend = getattr(self.opts, "backend", "auto") or "auto"
-        if backend != "auto":
-            self.TITLE = "Nuitka" if backend == "nuitka" else "PyInstaller"
-            return backend
-        if which_cmd("pyinstaller") or self.deps.ensure("pyinstaller"):
-            return "pyinstaller"
-        if which_cmd("nuitka") or self.deps.ensure("nuitka"):
-            return "nuitka"
-        raise BuildError("لا يوجد PyInstaller ولا Nuitka — ثبّت أحدهما:\n"
-                         f"    \"{sys.executable}\" -m pip install pyinstaller")
+    def build(self) -> List[Path]:
+        self.check_features(icon=True, data=True, hidden=True)
+        self.check_backend()
+        entry = self.cfg.need_entry()
+        # [toolbox compat] --backend overrides/engine-selects:
+        #   nuitka -> Nuitka, pyinstaller -> PyInstaller,
+        #   cx_freeze -> not shipped here: a clear warning + PyInstaller.
+        backend = (getattr(self.cfg, "backend", "") or "").strip().lower()
+        if backend == "nuitka":
+            self.cfg.engine = "nuitka"
+        elif backend == "cx_freeze":
+            warn("cx_freeze backend is not wired into PolyBuild — using PyInstaller "
+                 "instead (same single-folder/onefile output).")
+        if self.cfg.engine == "nuitka":
+            return self._nuitka(entry)
+        return self._pyinstaller(entry)
 
-    def _add_data_args(self) -> List[str]:
-        args: List[str] = []
-        for item in (getattr(self.opts, "add_data", None) or []):
-            if "=" not in item:
-                warn(f"تجاهل --add-data غير صالح (الصيغة SRC=DEST): {item}")
-                continue
-            src, dst = item.split("=", 1)
-            if not (self.project / src).exists():
-                warn(f"تجاهل --add-data: الملف غير موجود {src}")
-                continue
-            # [إصلاح] فاصل PyInstaller يعتمد على النظام المضيف (';' على Windows)
-            args += ["--add-data", f"{src}{os.pathsep}{dst}"]
-        return args
+    def _pyinstaller(self, entry: Path) -> List[Path]:
+        # [fix] run via 'python -m PyInstaller' + module check — the plain
+        # 'pyinstaller' binary is often missing from PATH on Windows.
+        if not self.deps.ensure_python_module("PyInstaller", "pyinstaller",
+                                              purpose="Python packaging"):
+            raise BuildError("PyInstaller is required for Python builds.")
+        if self.cfg.crossing:
+            warn("PyInstaller cannot cross-compile — building for the host OS.")
+        work = self.project / ".polybuild_tmp" / "pyi"
+        work.mkdir(parents=True, exist_ok=True)
+        cmd = [sys.executable, "-m", "PyInstaller",
+               "--noconfirm", "--clean",
+               "--distpath", str(self.out), "--workpath", str(work),
+               "--specpath", str(work), "--name", self.cfg.name]
+        if self.cfg.onefile:
+            cmd.append("--onefile")
+        if self.cfg.noconsole:
+            cmd.append("--windowed")
+        # [new] application icon (.ico on Windows / .icns on macOS)
+        if self.cfg.icon:
+            cmd += ["--icon", str(self.cfg.icon)]
+        # [new] extra data -> --add-data with the OS-specific separator
+        for src, dest in self.cfg.add_data:
+            cmd += ["--add-data", f"{src}{os.pathsep}{dest}"]
+        # [toolbox compat] --hidden-import -> PyInstaller hidden imports
+        for mod in self.cfg.hidden_imports:
+            cmd += ["--hidden-import", mod]
+        cmd.append(str(entry))
+        self.run(cmd, timeout=TIMEOUT_LONG)
+        stem = self.cfg.name
+        return self.emit([self.out / (stem + ".exe"), self.out / stem,
+                          self.out / (stem + ".app")])
 
-    def _compile(self) -> Path:
-        backend = self._pick_backend()
-        entry = self.entry or ProjectDetector(self.project).detect_entry(LangType.PYTHON)
-        if not entry:
-            pys = [f for f in self.project.glob("*.py")]
-            entry = pys[0].name if len(pys) == 1 else "main.py"
-        entry_path = self.project / entry
-        if not entry_path.exists():
-            raise BuildError(f"نقطة الدخول غير موجودة: {entry} — حدّدها بـ --script")
-        ext = exe_ext(self.target_os)
-        final = self.out / (self.name + ext)
-        args: List[str] = []
-        if backend == "pyinstaller":
-            self._require(["pyinstaller"])
-            cmd = [which_cmd("pyinstaller") or "pyinstaller", "--noconfirm", "--clean",
-                   "--distpath", str(self.out),
-                   "--workpath", str(self._tmp("pyi_work")),
-                   "--specpath", str(self._tmp("pyi_spec")),
-                   "--name", self.name]
-            if self.opts.onefile:
-                cmd.append("--onefile")
-            if not self.opts.console:
-                cmd.append("--windowed")
-            if self.icon:
-                cmd += ["--icon", self.icon]
-            for h in (getattr(self.opts, "hidden_imports", None) or []):
-                cmd += ["--hidden-import", h]
-            cmd += self._add_data_args()
-            if self.target_os == "windows" and current_os() != "windows":
-                warn("PyInstaller لا يدعم cross-compile لـ Windows من نظام آخر — سيُبنى للنظام الحالي.")
-            cmd.append(entry)
-            args = cmd
-        else:
-            self._require(["nuitka"])
-            cmd = [sys.executable, "-m", "nuitka", "--standalone",
-                   "--output-dir", str(self.out), "--output-filename", self.name + ext,
-                   "--remove-output", "--no-prompt-file"]
-            if self.opts.onefile:
-                cmd.append("--onefile")
-            if not self.opts.console and self.target_os == "windows":
-                cmd.append("--windows-disable-console")
-            if self.icon and self.target_os == "windows":
-                cmd.append(f"--windows-icon-from-ico={self.icon}")
-            elif self.icon and current_os() == "linux":
-                cmd.append(f"--linux-onefile-icon={self.icon}")
-            for h in (getattr(self.opts, "hidden_imports", None) or []):
-                cmd.append(f"--include-module={h}")
-            for item in (getattr(self.opts, "add_data", None) or []):
-                if "=" in item:
-                    cmd.append(f"--include-data-files={item}")
-            cmd.append(entry)
-            args = cmd
-        self._run(args, timeout=TIMEOUT_LONG)
-        if backend == "nuitka" and self.opts.onefile:
-            return self._artifact(self.out / (self.name + ext),
-                                  self.out / (entry_path.stem + ext)) or final
-        if not self.opts.onefile:
-            bundled = final if final.exists() else self._find_executable(self.out / self.name)
-            return bundled or final
-        return self._artifact(final) or self._find_executable(self.out) or final
-
-    def _print_result(self, path: Path) -> None:
-        if path.is_dir():
-            ok(f"البناء اكتمل (مجلد): {path}")
-            hint("وزّع المجلد كاملًا أو استخدم --onefile لملف واحد.")
-        else:
-            ok("البناء اكتمل: " + str(path))
-
-    def _update_project_deps(self) -> None:
-        req = self.project / "requirements.txt"
-        if req.exists():
-            self._run([sys.executable, "-m", "pip", "install", "-U", "-r", str(req)],
-                      timeout=TIMEOUT_PKG)
+    def _nuitka(self, entry: Path) -> List[Path]:
+        if not self.deps.ensure_python_module("nuitka", "nuitka",
+                                              purpose="Python compilation"):
+            raise BuildError("Nuitka is required for --engine nuitka.")
+        if self.cfg.crossing:
+            warn("Nuitka cannot cross-compile — building for the host OS.")
+        ext = exe_ext(current_os())
+        stem, entry_stem = self.cfg.name, entry.stem
+        cmd = [sys.executable, "-m", "nuitka",
+               "--output-dir", str(self.out),
+               "--assume-yes-for-downloads", "--remove-output"]
+        cmd.append("--onefile" if self.cfg.onefile else "--standalone")
+        if self.cfg.noconsole:
+            cmd.append("--windows-disable-console" if os.name == "nt"
+                       else "--disable-console")
+        # [new] icon: Windows (.ico) / macOS (.icns); ELF has no icon resource
+        if self.cfg.icon:
+            if self.cfg.target_os == "windows":
+                cmd.append(f"--windows-icon-from-ico={self.cfg.icon}")
+            elif self.cfg.target_os == "macos":
+                cmd.append(f"--macos-app-icon={self.cfg.icon}")
+            else:
+                warn("--icon ignored: Nuitka cannot embed icons in Linux ELF binaries.")
+        # [new] extra data -> include-data-files / include-data-dir
+        for src, dest in self.cfg.add_data:
+            if src.is_dir():
+                cmd.append(f"--include-data-dir={src}={dest}")
+            else:
+                cmd.append(f"--include-data-files={src}={dest}")
+        # [toolbox compat] --hidden-import -> Nuitka include-module
+        for mod in self.cfg.hidden_imports:
+            cmd.append(f"--include-module={mod}")
+        cmd.append(str(entry))
+        self.run(cmd, timeout=TIMEOUT_XLONG)
+        return self.emit([self.out / (stem + ext), self.out / stem,
+                          self.out / (stem + ".dist"), self.out / (stem + ".bin"),
+                          self.out / (entry_stem + ext), self.out / entry_stem,
+                          self.out / (entry_stem + ".dist")])
 
 
 class NodeBuilder(BaseBuilder):
-    """Node.js عبر pkg (يُنفَّذ عبر npx — بلا تثبيت عالمي)."""
     LANG = LangType.NODE
-    TITLE = "pkg"
+    TOOL_LABEL = "pkg (via npx)"
+    PLATFORM = {"windows": "win", "linux": "linux", "macos": "macos"}
+    SUPPORTED_BACKENDS = ("pkg", "nexe")
 
-    def _compile(self) -> Path:
-        self._require(["node", "npm"])
-        if not (self.project / "node_modules").exists() or self.opts.update_deps:
-            info("تثبيت تبعيات npm …")
-            self._run([which_cmd("npm") or "npm", "install"], timeout=TIMEOUT_PKG)
-        entry = self.entry or ProjectDetector(self.project).detect_entry(LangType.NODE)
-        if not entry or not (self.project / entry).exists():
-            raise BuildError("لم أعثر على نقطة الدخول — حدّدها بـ --script main.js")
-        self._require(["pkg"])
-        target = {"windows": "node18-win-x64", "linux": "node18-linux-x64",
-                  "macos": "node18-macos-x64"}.get(self.target_os)
-        if not target:
-            raise BuildError("pkg لا يدعم بناء Android — استهدف windows/linux/macos.")
+    def build(self) -> List[Path]:
+        self.check_features()      # pkg cannot embed icons or bundle assets
+        self.check_backend()       # nexe -> warning + pkg fallback
+        entry = self.cfg.need_entry()
+        if entry.suffix.lower() == ".ts":
+            hint("pkg builds TypeScript entries when package.json bin/scripts "
+                 "are configured; otherwise compile with tsc first.")
+        self.deps.require(["node", "npx"], purpose="Node.js packaging")
+        plat = self.PLATFORM.get(self.cfg.target_os)
+        if not plat:
+            raise BuildError(f"pkg does not support target OS '{self.cfg.target_os}'.")
+        arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
+        out = self.out / (self.cfg.name + exe_ext(self.cfg.target_os))
+        # [fix] resolve npx to its full path (npx.cmd on Windows)
         npx = which_cmd("npx") or "npx"
-        out_name = self.out / (self.name + exe_ext(self.target_os))
-        self._run([npx, "--yes", "pkg", entry, "--targets", target,
-                   "--output", str(out_name)], timeout=TIMEOUT_LONG)
-        return self._artifact(out_name) or out_name
-
-    def _update_project_deps(self) -> None:
-        self._require(["npm"])
-        self._run([which_cmd("npm") or "npm", "update"], timeout=TIMEOUT_PKG)
-
-
-class RubyBuilder(BaseBuilder):
-    """Ruby عبر ocra — Windows فقط (ocra لا يعمل على Linux/macOS)."""
-    LANG = LangType.RUBY
-    TITLE = "ocra"
-
-    def _compile(self) -> Path:
-        if current_os() != "windows":
-            # [إصلاح] رفض صريح بدل تسليم ملف مضلّل
-            raise BuildError("ocra يعمل على Windows فقط. على Linux/macOS ثبّت "
-                             "Ruby وواصل التشغيل كمصدر، أو استخدم Windows لبناء exe.")
-        self._require(["ruby"])
-        self._require(["gem"])
-        self._require(["ocra"])
-        entry = self.entry or ProjectDetector(self.project).detect_entry(LangType.RUBY)
-        if not entry:
-            raise BuildError("لم أعثر على ملف .rb — حدّده بـ --script")
-        out_name = self.out / (self.name + ".exe")
-        cmd = [which_cmd("ocra") or "ocra", entry, "--output", str(out_name)]
-        if not self.opts.console:
-            cmd.append("--windows")
-        self._run(cmd, timeout=TIMEOUT_LONG)
-        return out_name
-
-    def _update_project_deps(self) -> None:
-        if (self.project / "Gemfile").exists() and which_cmd("bundle"):
-            self._run(["bundle", "update"], timeout=TIMEOUT_PKG)
-
-
-class PerlBuilder(BaseBuilder):
-    """Perl: PAR::Packer (pp) عند توفره، وإلا توزيع مباشر (مجلد جاهز)."""
-    LANG = LangType.PERL
-    TITLE = "PAR::Packer / توزيع مباشر"
-
-    def _compile(self) -> Path:
-        entry = self.entry or ProjectDetector(self.project).detect_entry(LangType.PERL)
-        if not entry:
-            raise BuildError("لم أعثر على ملف .pl — حدّده بـ --script")
-        if which_cmd("pp") or (self.deps.ensure("pp") and which_cmd("pp")):
-            out_name = self.out / self.name
-            self._run([which_cmd("pp") or "pp", "-o", str(out_name), entry],
-                      timeout=TIMEOUT_LONG)
-            return out_name
-        # توزيع مباشر: مصدر + مكتبات + مشغّلات
-        info("pp غير متاح — إنشاء حزمة توزيع مباشر (بدون exe).")
-        dest = self._copy_into(self.project, self.out / (self.name + "-perl"))
-        hint("لتوليد exe واحد: cpan -T PAR::Packer ثم أعد المحاولة (pp).")
-        return dest
-
-
-class LoveBuilder(BaseBuilder):
-    """Lua / LÖVE — حزم .love أو دمج داخل love binary (cat / copy bytes)."""
-    LANG = LangType.LOVE
-    TITLE = "LÖVE"
-
-    def _compile(self) -> Path:
-        entry = self.entry or "main.lua"
-        if not (self.project / entry).exists():
-            raise BuildError("مشروع LÖVE يحتاج main.lua — حدّد نقطة الدخول بـ --script")
-        self._require(["love"])
-        # 1) إنشاء game.love (zip بمصادر المشروع)
-        love_pkg = self.out / (self.name + ".love")
-        with zipfile.ZipFile(love_pkg, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in collect_files(self.project, extra_excludes={self.out.name}):
-                arc = f.relative_to(self.project)
-                if str(arc).startswith(str(self.out.relative_to(self.project))):
-                    continue
-                zf.write(f, str(arc))
-        ok("حزمة " + love_pkg.name + " جاهزة.")
-        # 2) الدمج داخل love binary (تفسير + بيانات في ملف واحد)
-        love_bin = which_cmd("love")
-        if love_bin and current_os() == "windows":
-            fused = self.out / (self.name + ".exe")
-            with open(love_bin, "rb") as a, open(love_pkg, "rb") as b, open(fused, "wb") as w:
-                w.write(a.read()); w.write(b.read())   # تقنية الدمج الرسمية لـ LÖVE
-            return fused
-        hint(f"لتوليد تنفيذي واحد: ادمج ثنائية love مع {love_pkg.name} "
-             f"(cat love {love_pkg.name} > {self.name}) — على Windows: copy /b love.exe+{love_pkg.name} {self.name}.exe")
-        return love_pkg
-
-    def _print_result(self, path: Path) -> None:
-        ok("البناء اكتمل: " + str(path))
-
-
-class LuaBuilder(LoveBuilder):
-    """Lua: يُبنى بتضمينه داخل love binary (المسار القياسي لتوزيع Lua)."""
-    LANG = LangType.LUA
-    TITLE = "LÖVE fusion"
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 11) البنّاؤون — المترجمة الأصلية (Native)
-# ═══════════════════════════════════════════════════════════════════════════
-
-class _CLikeBuilder(BaseBuilder):
-    """أساس مشترك لـ C/C++: CMake ثم Make ثم مترجم مباشر."""
-    COMPILER = "gcc"
-    CROSS_COMPILER = "x86_64-w64-mingw32-gcc"
-
-    def _cross_needed(self) -> bool:
-        return self.target_os == "windows" and current_os() != "windows"
-
-    def _cc(self) -> str:
-        if self._cross_needed():
-            cc = which_cmd(self.CROSS_COMPILER)
-            if not cc:
-                # [إصلاح] فشل واضح بدل binary مضلّل عند غياب mingw
-                raise BuildError("cross-compile إلى Windows يتطلب mingw-w64 وغير مثبت:\n"
-                                 "    sudo apt-get install -y mingw-w64")
-            return cc
-        return self.COMPILER
-
-    def _compiler_sources(self) -> Path:
-        exts = getattr(self, "SRC_EXTS", (".c",))
-        cc = self._cc()
-        rel = rel_files(collect_files(self.project), self.project)
-        srcs = [f for f in rel if f.suffix in exts]
-        if not srcs:
-            raise BuildError("لم أعثر على ملفات مصدر " + "/".join(exts))
-        out = self.out / (self.name + exe_ext(self.target_os))
-        cmd = [cc, "-O2"] + [str(s) for s in srcs] + ["-o", str(out), "-lm"]
-        self._run(cmd, timeout=TIMEOUT_LONG)
-        return out
-
-    def _compile(self) -> Path:
-        if (self.project / "CMakeLists.txt").exists():
-            return self._via_cmake()
-        if (self.project / "Makefile").exists() or (self.project / "makefile").exists():
-            return self._via_make()
-        return self._compiler_sources()
-
-    def _via_cmake(self) -> Path:
-        self._require(["cmake"], purpose="بناء CMake")
-        build_dir = self._tmp("cmake_build")
-        cross = []
-        if self._cross_needed():
-            self._require(["x86_64-w64-mingw32-gcc"])
-            toolchain = build_dir / "toolchain.cmake"
-            cc, cxx = which_cmd(self.CROSS_COMPILER), which_cmd("x86_64-w64-mingw32-g++")
-            toolchain.write_text(
-                "set(CMAKE_SYSTEM_NAME Windows)\n"
-                f"set(CMAKE_C_COMPILER {cc})\n"
-                + (f"set(CMAKE_CXX_COMPILER {cxx})" if cxx else ""))
-            cross = ["-DCMAKE_TOOLCHAIN_FILE=" + str(toolchain)]
-        self._run(["cmake", "-S", ".", "-B", str(build_dir),
-                   "-DCMAKE_BUILD_TYPE=Release"] + cross, timeout=TIMEOUT_MED)
-        self._run(["cmake", "--build", str(build_dir), "--config", "Release"],
-                  timeout=TIMEOUT_LONG)
-        exe = self._find_executable(build_dir)
-        if not exe:
-            raise BuildError("CMake اكتمل لكن لم أجد الملف التنفيذي داخل مجلد البناء.")
-        return self._copy_into(exe, self.out)
-
-    def _via_make(self) -> Path:
-        self._require(["make"], purpose="بناء Make")
-        if self._cross_needed():
-            warn("Makefile قد لا يحترم cross-compile — يُفضّل CMake مع toolchain.")
-        build_dir = self._tmp("make_build")
-        for f in self.project.iterdir():
-            if f.is_file() and f.name.lower() in ("makefile", "gnumakefile"):
-                shutil.copy2(f, build_dir / f.name)
-        self._run(["make", "-C", str(build_dir)], timeout=TIMEOUT_LONG)
-        exe = self._find_executable(build_dir)
-        if not exe:
-            raise BuildError("make اكتمل لكن لم أجد الملف التنفيذي.")
-        return self._copy_into(exe, self.out)
-
-
-class CBuilder(_CLikeBuilder):
-    LANG = LangType.C
-    TITLE = "gcc / CMake / Make"
-    COMPILER = "gcc"
-    CROSS_COMPILER = "x86_64-w64-mingw32-gcc"
-    SRC_EXTS = (".c",)
-
-    def _compile(self) -> Path:
-        if (self.project / "CMakeLists.txt").exists():
-            return self._via_cmake()
-        if (self.project / "Makefile").exists():
-            return self._via_make()
-        self._require(["gcc"], purpose="بناء C")
-        return self._compiler_sources()
-
-
-class CppBuilder(_CLikeBuilder):
-    LANG = LangType.CPP
-    TITLE = "g++ / CMake / Make"
-    COMPILER = "g++"
-    CROSS_COMPILER = "x86_64-w64-mingw32-g++"
-    SRC_EXTS = (".cpp", ".cc", ".cxx")
-
-    def _compile(self) -> Path:
-        if (self.project / "CMakeLists.txt").exists():
-            return self._via_cmake()
-        if (self.project / "Makefile").exists():
-            return self._via_make()
-        self._require(["g++"], purpose="بناء C++")
-        return self._compiler_sources()
-
-
-class RustBuilder(BaseBuilder):
-    """Rust عبر cargo — cross إلى Windows عبر rustup target + mingw linker."""
-    LANG = LangType.RUST
-    TITLE = "cargo"
-
-    def _cargo_name(self) -> str:
-        name = regex_first(read_small_text(self.project / "Cargo.toml"),
-                           r'^\s*name\s*=\s*"([^"]+)"')
-        return sanitize_name(name or self.name)
-
-    def _compile(self) -> Path:
-        self._require(["cargo"], purpose="بناء Rust")
-        cargo = which_cmd("cargo") or "cargo"
-        crate = self._cargo_name()
-        env = None
-        target_dir_arg: List[str] = []
-        if self.target_os == "windows" and current_os() != "windows":
-            triple = "x86_64-pc-windows-gnu"
-            if not which_cmd("x86_64-w64-mingw32-gcc"):
-                raise BuildError("cross-compile لـ Windows يتطلب mingw-w64 (linker):\n"
-                                 "    sudo apt-get install -y mingw-w64")
-            if which_cmd("rustup"):
-                info("إضافة هدف " + triple + " …")
-                self._run(["rustup", "target", "add", triple], timeout=TIMEOUT_MED)
-            else:
-                raise BuildError("rustup غير موجود — ثبّته من rustup.rs لإدارة أهداف cross.")
-            env = {"CARGO_TARGET_" + "X86_64_PC_WINDOWS_GNU" + "_LINKER":
-                   "x86_64-w64-mingw32-gcc"}
-            target_dir_arg = ["--target", triple]
-            sub = Path("target") / triple / "release"
-        else:
-            sub = Path("target") / "release"
-        self._run([cargo, "build", "--release"] + target_dir_arg, timeout=TIMEOUT_LONG, env=env)
-        ext = exe_ext(self.target_os)
-        out = self._artifact(self.project / sub / (crate + ext)) or \
-              self._find_executable(self.project / Path("target"))
-        if not out:
-            raise BuildError("cargo اكتمل لكن لم أجد الملف التنفيذي في target/.")
-        return self._copy_into(out, self.out)
-
-    def _update_project_deps(self) -> None:
-        self._require(["cargo"])
-        self._run([which_cmd("cargo") or "cargo", "update"], timeout=TIMEOUT_PKG)
-
-
-class GoBuilder(BaseBuilder):
-    """Go عبر go build — cross مدمج في الأداة عبر GOOS/GOARCH."""
-    LANG = LangType.GO
-    TITLE = "go build"
-
-    def _compile(self) -> Path:
-        self._require(["go"], purpose="بناء Go")
-        go = which_cmd("go") or "go"
-        env = None
-        ext = ""
-        if self.target_os == "windows" and current_os() != "windows":
-            env = {"GOOS": "windows", "GOARCH": "amd64", "CGO_ENABLED": "0"}
-            ext = ".exe"
-        elif self.target_os != current_os():
-            m = {"linux": ("linux", "amd64"), "macos": ("darwin", "arm64")}.get(self.target_os)
-            if m:
-                env = {"GOOS": m[0], "GOARCH": m[1], "CGO_ENABLED": "0"}
-        out = self.out / (self.name + ext)
-        if not (self.project / "go.mod").exists():
-            warn("go.mod غير موجود — سأجرب بناء المجلد الحالي مباشرة.")
-        self._run([go, "build", "-o", str(out), "."], timeout=TIMEOUT_LONG, env=env)
-        if not out.exists():
-            raise BuildError("go build اكتمل بدون ملف ناتج — تأكد من وجود package main.")
-        return out
-
-    def _update_project_deps(self) -> None:
-        self._require(["go"])
-        self._run([which_cmd("go") or "go", "mod", "tidy"], timeout=TIMEOUT_PKG)
-
-
-class NimBuilder(BaseBuilder):
-    """Nim عبر nim c — cross إلى Windows عبر mingw."""
-    LANG = LangType.NIM
-    TITLE = "nim c"
-
-    def _compile(self) -> Path:
-        self._require(["nim"], purpose="بناء Nim")
-        entry = self.entry or ProjectDetector(self.project).detect_entry(LangType.NIM)
-        if not entry:
-            nims = [f for f in self.project.glob("*.nim")]
-            entry = nims[0].name if nims else "main.nim"
-        if not (self.project / entry).exists():
-            raise BuildError(f"نقطة دخول Nim غير موجودة: {entry} — حدّدها بـ --script")
-        out = self.out / (self.name + exe_ext(self.target_os))
-        cmd = [which_cmd("nim") or "nim", "c", "-d:release", "--opt:speed",
-               "--outFile:" + str(out)]
-        if self.target_os == "windows" and current_os() != "windows":
-            # [إصلاح] تحقق mingw قبل cross — لا binary مضلّل
-            if not which_cmd("x86_64-w64-mingw32-gcc"):
-                raise BuildError("cross لـ Windows يتطلب mingw-w64:\n"
-                                 "    sudo apt-get install -y mingw-w64")
-            cmd += ["--os:windows", "--cpu:amd64", "-d:mingw",
-                    "--gcc.exe:x86_64-w64-mingw32-gcc",
-                    "--gcc.linkerexe:x86_64-w64-mingw32-gcc"]
-        cmd.append(entry)
-        self._run(cmd, timeout=TIMEOUT_LONG)
-        return out
-
-
-class ZigBuilder(BaseBuilder):
-    """Zig — cross-compile مدمج في المترجم نفسه (بلا أدوات إضافية)."""
-    LANG = LangType.ZIG
-    TITLE = "zig"
-
-    def _compile(self) -> Path:
-        self._require(["zig"], purpose="بناء Zig")
-        zig = which_cmd("zig") or "zig"
-        ext = exe_ext(self.target_os)
-        if (self.project / "build.zig").exists():
-            prefix = self._tmp("zig_prefix")
-            target = {"windows": "-Dtarget=x86_64-windows",
-                      "linux": "-Dtarget=x86_64-linux",
-                      "macos": "-Dtarget=aarch64-macos"}.get(self.target_os, "")
-            self._run([zig, "build", "-Doptimize=ReleaseFast", target,
-                       "--prefix", str(prefix)], timeout=TIMEOUT_LONG)
-            exe = self._find_executable(prefix)
-            if not exe:
-                raise BuildError("zig build اكتمل بدون ملف تنفيذي في --prefix.")
-            return self._copy_into(exe, self.out)
-        entry = self.entry or ProjectDetector(self.project).detect_entry(LangType.ZIG) or "main.zig"
-        if not (self.project / entry).exists():
-            raise BuildError(f"ملف Zig غير موجود: {entry} — حدّده بـ --script")
-        out = self.out / (self.name + ext)
-        cmd = [zig, "build-exe", entry, "-O", "ReleaseFast", "-femit-bin=" + str(out)]
-        if self.target_os == "windows" and current_os() != "windows":
-            cmd.append("-target")
-            cmd.append("x86_64-windows-gnu")
-        self._run(cmd, timeout=TIMEOUT_LONG)
-        return out
-
-
-class CrystalBuilder(BaseBuilder):
-    """Crystal — بناء أصلي فقط: يرفض cross إلى Windows صراحةً."""
-    LANG = LangType.CRYSTAL
-    TITLE = "crystal build"
-
-    def _compile(self) -> Path:
-        if self.target_os != current_os():
-            # [إصلاح] رفض صريح — Crystal لا يدعم cross إلى Windows حاليًا
-            raise BuildError("Crystal يدعم البناء الأصلي فقط (لا cross-compile إلى "
-                             "Windows من Linux/macOS). ابنِ على النظام الهدف نفسه.")
-        self._require(["crystal"], purpose="بناء Crystal")
-        entry = self.entry or ProjectDetector(self.project).detect_entry(LangType.CRYSTAL)
-        if not entry:
-            shard = self.project / "shard.yml"
-            entry = regex_first(read_small_text(shard), r"main:\s*(\S+)") or "main.cr"
-        if not (self.project / entry).exists():
-            raise BuildError(f"نقطة دخول Crystal غير موجودة: {entry}")
-        out = self.out / self.name
-        self._run([which_cmd("crystal") or "crystal", "build", "--release",
-                   "--no-color", entry, "-o", str(out)], timeout=TIMEOUT_LONG)
-        return out
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 11) البنّاؤون — .NET وJVM
-# ═══════════════════════════════════════════════════════════════════════════
-
-class DotnetBuilder(BaseBuilder):
-    """.NET عبر dotnet publish — self-contained + ملف واحد."""
-    LANG = LangType.DOTNET
-    TITLE = "dotnet publish"
-
-    def _rid(self) -> str:
-        if self.target_os == "windows":
-            return "win-x64"
-        if self.target_os == "macos":
-            return "osx-arm64" if platform.machine() == "arm64" else "osx-x64"
-        if self.target_os == "linux":
-            return "linux-arm64" if platform.machine() == "arm64" else "linux-x64"
-        # native حسب المضيف
-        return {"windows": "win-x64", "macos": "osx-x64"}.get(current_os(), "linux-x64")
-
-    def _find_project(self) -> Path:
-        for f in sorted(self.project.glob("*.csproj")) + sorted(self.project.glob("*.sln")):
-            return f
-        deep = collect_files(self.project, max_depth=3)
-        for f in deep:
-            if f.suffix in (".csproj", ".sln"):
-                return f
-        raise BuildError("لم أعثر على .csproj أو .sln — هذا ليس مشروع .NET؟")
-
-    def _compile(self) -> Path:
-        if self.target_os == "android":
-            raise BuildError("بناء Android عبر .NET يتطلب workload خاص — استخدم "
-                             "AndroidBuilder (Gradle) أو ثبّت dotnet workload install maui-android.")
-        self._require(["dotnet"], purpose="بناء .NET")
-        proj = self._find_project()
-        out = self.out / (self.name + "-publish")
-        cmd = [which_cmd("dotnet") or "dotnet", "publish", str(proj),
-               "-c", "Release", "-r", self._rid(),
-               "--self-contained", "true",
-               "-p:PublishSingleFile=true",
-               "-p:IncludeNativeLibrariesForSelfExtract=true",
-               "-o", str(out)]
-        if self.opts.verbose:
-            cmd.append("-v:minimal")
-        self._run(cmd, timeout=TIMEOUT_LONG)
-        exe = self._find_executable(out)
-        if not exe:
-            raise BuildError("dotnet publish اكتمل بدون ملف تنفيذي.")
-        return exe
-
-    def _update_project_deps(self) -> None:
-        self._require(["dotnet"])
-        proj = self._find_project()
-        self._run([which_cmd("dotnet") or "dotnet", "restore", str(proj), "--force"],
-                  timeout=TIMEOUT_PKG)
-
-
-class JavaBuilder(BaseBuilder):
-    """Java: Gradle أو Maven أو javac مباشر + JAR؛ jpackage عند --onefile."""
-    LANG = LangType.JAVA
-    TITLE = "javac / jar / jpackage"
-
-    def _compile(self) -> Path:
-        gradlew = self.project / ("gradlew.bat" if os.name == "nt" else "gradlew")
-        if gradlew.exists():
-            return self._via_gradle(gradlew)
-        if (self.project / "pom.xml").exists():
-            return self._via_maven()
-        return self._via_javac()
-
-    def _gradle_cmd(self, gradlew: Path) -> List[str]:
-        if os.access(gradlew, os.X_OK) or os.name == "nt":
-            return [str(gradlew)]
-        return ["sh", str(gradlew)]    # [إصلاح] wrapper بلا صلاحية تنفيذ
-
-    def _via_gradle(self, gradlew: Path) -> Path:
-        self._require(["java"], purpose="بناء Gradle")
-        task = "assembleRelease" if self.target_os != "native" else "build"
-        cmd = self._gradle_cmd(gradlew) + [task, "--console=plain", "-q"]
-        if self.opts.update_deps:
-            cmd.append("--refresh-dependencies")
-        proc = self._run(cmd, timeout=TIMEOUT_LONG)
-        jar = self._newest(self.project / "build" / "libs", (".jar",))
-        if not jar:
-            raise BuildError("Gradle اكتمل لكن لم أجد JAR في build/libs.\n"
-                             + tail_lines((proc.stderr or "") + (proc.stdout or ""), 4))
-        return self._copy_into(jar, self.out)
-
-    def _via_maven(self) -> Path:
-        self._require(["mvn", "java"], purpose="بناء Maven")
-        cmd = [which_cmd("mvn") or "mvn", "-q", "-DskipTests", "package"]
-        if self.opts.update_deps:
-            cmd.append("-U")
-        self._run(cmd, timeout=TIMEOUT_LONG)
-        jar = self._newest(self.project / "target", (".jar",), skip=("original-",))
-        if not jar:
-            raise BuildError("Maven اكتمل لكن لم أجد JAR في target/.")
-        return self._copy_into(jar, self.out)
-
-    def _via_javac(self) -> Path:
-        self._require(["javac", "jar", "java"], purpose="بناء Java مباشر")
-        rel = rel_files(collect_files(self.project), self.project)
-        srcs = [f for f in rel if f.suffix == ".java"]
-        if not srcs:
-            raise BuildError("لا يوجد Gradle/Maven ولا ملفات .java — هل هذا مشروع Java؟")
-        classes = self._tmp("java_classes")
-        cmd = [which_cmd("javac") or "javac", "-d", str(classes)] + [str(s) for s in srcs]
-        self._run(cmd, timeout=TIMEOUT_LONG)
-        main_class = self._pick_main_class(classes)
-        jar_path = self.out / (self.name + ".jar")
-        jar = which_cmd("jar") or "jar"
-        if main_class:
-            self._run([jar, "cfe", str(jar_path), main_class, "-C", str(classes), "."],
-                      timeout=TIMEOUT_MED)
-        else:
-            self._run([jar, "cf", str(jar_path), "-C", str(classes), "."], timeout=TIMEOUT_MED)
-            hint("لم أحدد Main-Class — شغّل الـ JAR بـ java -cp " + jar_path.name + " <MainClass>")
-        self._maybe_jpackage(jar_path)
-        return jar_path
-
-    def _pick_main_class(self, classes: Path) -> Optional[str]:
-        for f in collect_files(classes, max_files=2000):
-            if f.suffix != ".class" or f.name.endswith(("Test.class",)):
-                continue
-            text = f.read_bytes()[:65536]
-            if b"main" in text and b"([Ljava/lang/String;)V" in text:
-                relc = f.relative_to(classes)
-                return ".".join(relc.with_suffix("").parts)
-        return None
-
-    def _maybe_jpackage(self, jar: Path) -> None:
-        """--onefile + jpackage متوفر → صورة تطبيق أصلية (app-image)."""
-        if not getattr(self.opts, "onefile", False):
-            return
-        jp = which_cmd("jpackage")
-        if not jp:
-            hint("jpackage غير متوفر — سيتم تسليم JAR فقط. "
-                 "ثبّت JDK 14+ للحصول على صورة أصلية.")
-            return
-        info("تغليف أصلي عبر jpackage …")
-        dest = self.out / "jpackage"
-        cmd = [jp, "--input", str(self.out), "--main-jar", jar.name,
-               "--name", self.name, "--type", "app-image", "--dest", str(dest)]
-        if self.icon and os.name == "nt":
-            cmd += ["--icon", self.icon]
-        proc = run_cmd(cmd, cwd=self.project, timeout=TIMEOUT_LONG)
-        if proc.returncode == 0 and dest.exists():
-            ok("صورة التطبيق: " + str(dest / self.name))
-        else:
-            warn("jpackage فشل (يحتاج WiX على Windows لصيغ msi/exe) — تم تسليم JAR.")
-
-    def _newest(self, folder: Path, exts: Tuple[str, ...],
-                skip: Tuple[str, ...] = ()) -> Optional[Path]:
-        if not folder.exists():
-            return None
-        cands = [f for f in folder.iterdir()
-                 if f.is_file() and f.suffix in exts
-                 and not any(f.name.startswith(s) for s in skip)
-                 and "javadoc" not in f.name and "sources" not in f.name]
-        return max(cands, key=lambda f: f.stat().st_mtime, default=None)
-
-    def _update_project_deps(self) -> None:
-        pass  # تُعالج داخل كل مسار (refresh-dependencies / -U)
-
-
-class KotlinBuilder(JavaBuilder):
-    """Kotlin: Gradle (kts) عند وجوده، وإلا kotlinc مباشر إلى JAR."""
-    LANG = LangType.KOTLIN
-    TITLE = "kotlinc / Gradle"
-
-    def _compile(self) -> Path:
-        gradlew = self.project / ("gradlew.bat" if os.name == "nt" else "gradlew")
-        has_gradle = gradlew.exists() or (self.project / "build.gradle.kts").exists() \
-            or (self.project / "settings.gradle.kts").exists()
-        if has_gradle:
-            return self._via_kotlin_gradle(gradlew)
-        return self._via_kotlinc()
-
-    def _via_kotlin_gradle(self, gradlew: Path) -> Path:
-        self._require(["java"], purpose="بناء Kotlin/Gradle")
-        cmd = (self._gradle_cmd(gradlew) if gradlew.exists() else ["gradle"]) \
-            + ["build", "--console=plain", "-q"]
-        self._run(cmd, timeout=TIMEOUT_LONG)
-        for d in (self.project / "build" / "libs",):
-            jar = self._newest(d, (".jar",))
-            if jar:
-                return self._copy_into(jar, self.out)
-        raise BuildError("Gradle اكتمل بدون JAR في build/libs.")
-
-    def _via_kotlinc(self) -> Path:
-        self._require(["kotlinc"], purpose="بناء Kotlin مباشر")
-        rel = rel_files(collect_files(self.project), self.project)
-        srcs = [f for f in rel if f.suffix in (".kt", ".kts")]
-        if not srcs:
-            raise BuildError("لا توجد ملفات .kt — حدّد المشروع الصحيح.")
-        jar_path = self.out / (self.name + ".jar")
-        self._run([which_cmd("kotlinc") or "kotlinc"] + [str(s) for s in srcs]
-                  + ["-include-runtime", "-d", str(jar_path)], timeout=TIMEOUT_LONG)
-        self._maybe_jpackage(jar_path)
-        return jar_path
-
-
-class ScalaBuilder(BaseBuilder):
-    """Scala: scala-cli عند توفره، وإلا sbt package."""
-    LANG = LangType.SCALA
-    TITLE = "scala-cli / sbt"
-
-    def _compile(self) -> Path:
-        entry = self.entry or ProjectDetector(self.project).detect_entry(LangType.SCALA)
-        if which_cmd("scala-cli"):
-            jar_path = self.out / (self.name + ".jar")
-            cmd = ["scala-cli", "--power", "package", "--assembly", "--force"]
-            if entry:
-                cmd.append(entry)
-            cmd += ["-o", str(jar_path)]
-            self._run(cmd, timeout=TIMEOUT_LONG)
-            return jar_path
-        if which_cmd("sbt") or (self.project / "project").is_dir():
-            self._require(["sbt"], purpose="بناء Scala")
-            self._run(["sbt", "--batch", "package"], timeout=TIMEOUT_LONG)
-            scala_dir = next((d for d in (self.project / "target").glob("scala-*")
-                              if d.is_dir()), None)
-            if scala_dir:
-                jar = self._newest_shared(scala_dir)
-                if jar:
-                    return self._copy_into(jar, self.out)
-            raise BuildError("sbt اكتمل بدون JAR في target/scala-*/.")
-        raise BuildError("ثبّت scala-cli أو sbt لبناء Scala:\n"
-                         "    curl -fLsS https://raw.githubusercontent.com/VirtusLab/coursier/main/cs-x86_64-pc-linux.gz | sh && cs install scala-cli")
-
-    def _newest_shared(self, folder: Path) -> Optional[Path]:
-        jars = [f for f in folder.glob("*.jar")
-                if f.is_file() and "sources" not in f.name and "javadoc" not in f.name]
-        return max(jars, key=lambda f: f.stat().st_mtime, default=None)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 11) البنّاؤون — الأطر (Flutter/Dart/Electron/Android/Godot) + كشف بدون بناء
-# ═══════════════════════════════════════════════════════════════════════════
-
-class FlutterBuilder(BaseBuilder):
-    """Flutter: apk / windows / macos / linux حسب الهدف."""
-    LANG = LangType.FLUTTER
-    TITLE = "flutter build"
-
-    def _compile(self) -> Path:
-        self._require(["flutter"], purpose="بناء Flutter")
-        flutter = which_cmd("flutter") or "flutter"
-        host = current_os()
-        if self.opts.update_deps:
-            self._run([flutter, "pub", "upgrade"], timeout=TIMEOUT_PKG)
-        elif not (self.project / ".dart_tool").exists():
-            self._run([flutter, "pub", "get"], timeout=TIMEOUT_PKG)
-
-        if self.target_os == "android":
-            self._run([flutter, "build", "apk", "--release"], timeout=TIMEOUT_LONG)
-            apk = self.project / "build/app/outputs/flutter-apk/app-release.apk"
-            if not apk.exists():
-                raise BuildError("flutter build apk اكتمل بدون APK — تحقق من توقيع التطبيق.")
-            return self._copy_into(apk, self.out)
-
-        # بناء سطح المكتب يتطلب نفس نظام الاستضافة
-        if self.target_os != host:
-            # [إصلاح] لا نسخّ مضلّلة: بناء سطح المكتب لا يدعم cross
-            raise BuildError(f"بناء Flutter لـ {self.target_os} يتم على نظام {self.target_os} "
-                             f"نفسه (المضيف الحالي {host}) — لا cross-compile لسطح المكتب.")
-        self._run([flutter, "build", self.target_os, "--release"], timeout=TIMEOUT_LONG)
-        folders = {"windows": self.project / "build/windows/x64/runner/Release",
-                   "linux": self.project / "build/linux/x64/release/bundle",
-                   "macos": self.project / "build/macos/Build/Products/Release"}
-        src = folders.get(self.target_os)
-        if not src or not src.exists():
-            raise BuildError(f"لم أجد مخرجات بناء {self.target_os} في المسار المتوقع.")
-        exe = self._find_executable(src)
-        if self.target_os in ("linux", "windows"):
-            # المجلد كاملًا ضروري (DLL/بيانات بجانب الملف التنفيذي)
-            return self._copy_into(src, self.out / (self.name + "-" + self.target_os))
-        return exe or src
-
-    def _update_project_deps(self) -> None:
-        self._require(["flutter"])
-        self._run([which_cmd("flutter") or "flutter", "pub", "upgrade"], timeout=TIMEOUT_PKG)
-
-
-class DartBuilder(BaseBuilder):
-    """Dart: ترجمة أصلية عبر dart compile exe."""
-    LANG = LangType.DART
-    TITLE = "dart compile exe"
-
-    def _compile(self) -> Path:
-        self._require(["dart"], purpose="بناء Dart")
-        dart = which_cmd("dart") or "dart"
-        if self.opts.update_deps or not (self.project / ".dart_tool").exists():
-            self._run([dart, "pub", "get"], timeout=TIMEOUT_PKG)
-        entry = self.entry or ProjectDetector(self.project).detect_entry(LangType.DART)
-        if not entry or not (self.project / entry).exists():
-            raise BuildError("لم أعثر على bin/main.dart — حدّد نقطة الدخول بـ --script")
-        out = self.out / (self.name + exe_ext(self.target_os))
-        self._run([dart, "compile", "exe", entry, "-o", str(out)], timeout=TIMEOUT_LONG)
-        return out
-
-    def _update_project_deps(self) -> None:
-        self._require(["dart"])
-        self._run([which_cmd("dart") or "dart", "pub", "upgrade"], timeout=TIMEOUT_PKG)
+        self.run([npx, "--yes", "pkg", str(entry),
+                  "--target", f"node18-{plat}-{arch}",
+                  "--output", str(out)], timeout=TIMEOUT_XLONG)
+        return self.emit([out])
 
 
 class ElectronBuilder(BaseBuilder):
-    """Electron عبر electron-builder (npx) — إخراج منصّة الهدف."""
     LANG = LangType.ELECTRON
-    TITLE = "electron-builder"
+    TOOL_LABEL = "electron-builder (via npx)"
+    FLAG = {"windows": "--win", "linux": "--linux", "macos": "--mac"}
+    SUPPORTED_BACKENDS = ("electron-builder",)
 
-    def _compile(self) -> Path:
-        self._require(["node", "npm"])
-        if not (self.project / "node_modules").exists() or self.opts.update_deps:
-            info("تثبيت تبعيات npm (قد يستغرق وقتًا — electron ثقيل) …")
-            self._run([which_cmd("npm") or "npm", "install"], timeout=TIMEOUT_LONG)
-        host = current_os()
-        if self.target_os == "android":
-            raise BuildError("Electron لا يدعم Android — استخدم Flutter/Cordova لهذا الهدف.")
-        if self.target_os == "macos" and host != "macos":
-            raise BuildError("بناء حزم macOS (.dmg) يتطلب جهاز macOS فعليًا — "
-                             "electron-builder يرفضها على Linux/Windows.")
-        flag = {"windows": "--win", "linux": "--linux", "macos": "--mac"}[self.target_os]
+    def build(self) -> List[Path]:
+        self.check_features(icon=True, data=True)
+        self.check_backend()
+        self.deps.require(["node", "npx"], purpose="Electron packaging")
+        flag = self.FLAG.get(self.cfg.target_os)
+        if not flag:
+            raise BuildError(f"electron-builder does not support target '{self.cfg.target_os}'.")
         npx = which_cmd("npx") or "npx"
-        cfg: Dict[str, Any] = {"directories": {"output": str(self.out)}}
-        pj = parse_json_file(self.project / "package.json")
-        if not pj.get("build"):
-            # [إصلاح] مشروع بلا إعدادات build → تمرير config مصغّر يعمل مباشرة
-            cfg.update({"appId": "com.polybuild." + self.name,
-                        "productName": self.name,
-                        "files": ["**/*"],
-                        "directories": {"output": str(self.out)}})
-        if self.icon:
-            cfg["icon"] = self.icon
-        cmd = [npx, "--yes", "electron-builder", flag, "--config", json.dumps(cfg)]
-        env = {"ELECTRON_DEVTOOLS": "1"} if getattr(self.opts, "devtools", False) else None
-        if getattr(self.opts, "devtools", False):
-            hint("ELECTRON_DEVTOOLS=1 — فعّلها داخل main.js: "
-                 "if (process.env.ELECTRON_DEVTOOLS) win.webContents.openDevTools()")
-        self._run(cmd, timeout=TIMEOUT_LONG, env=env)
-        exe = self._find_executable(self.out)
-        if not exe:
-            raise BuildError("electron-builder اكتمل بدون ملف تنفيذي داخل " + str(self.out))
-        return exe
+        ed_out = self.out / "electron"
+        env = {"CSC_IDENTITY_AUTO_DISCOVERY": "false"}
+        cmd = [npx, "--yes", "electron-builder", flag, "--x64",
+               f"--config.directories.output={ed_out}"]
+        # [new] icon via the config override (project-relative when possible)
+        if self.cfg.icon:
+            try:
+                icon_arg = self.cfg.icon.resolve() \
+                    .relative_to(self.project.resolve()).as_posix()
+            except ValueError:
+                icon_arg = str(self.cfg.icon.resolve())
+            cmd.append(f"--config.icon={icon_arg}")
+        # [new] --add-data -> extraResources entries (JSON config override)
+        if self.cfg.add_data:
+            extras = json.dumps([{"from": str(s), "to": d}
+                                 for s, d in self.cfg.add_data])
+            cmd.append(f"--config.extraResources={extras}")
+        self.run(cmd, timeout=TIMEOUT_XLONG, env=env)
+        wanted = {".exe", ".appimage", ".dmg", ".snap", ".deb", ".appx", ".msi"}
+        arts: List[Path] = []
+        if ed_out.exists():
+            for p in ed_out.rglob("*"):
+                try:
+                    if p.is_dir() and p.suffix == ".app":
+                        arts.append(p)
+                    elif p.is_file() and p.suffix.lower() in wanted \
+                            and p.stat().st_size > 0:
+                        arts.append(p)
+                except OSError:
+                    continue
+        if not arts:
+            raise BuildError("electron-builder finished but no installers were found.")
+        arts.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return self.emit(arts[:3])
 
-    def _update_project_deps(self) -> None:
-        self._require(["npm"])
-        self._run([which_cmd("npm") or "npm", "update"], timeout=TIMEOUT_PKG)
+
+class RubyBuilder(BaseBuilder):
+    LANG = LangType.RUBY
+    TOOL_LABEL = "Ocra"
+    SUPPORTED_BACKENDS = ("ocra",)
+
+    def build(self) -> List[Path]:
+        self.check_features()      # Ocra has no icon/data options
+        self.check_backend()
+        entry = self.cfg.need_entry()
+        if current_os() != "windows" or self.cfg.target_os != "windows":
+            raise BuildError(
+                "Ruby has no standalone native compiler — Ocra packaging is Windows-only.\n"
+                "Run this build on Windows, or ship the app together with the Ruby interpreter.")
+        self.deps.require(["ruby", "ocra"], purpose="Ruby packaging")
+        ocra = which_cmd("ocra") or "ocra"
+        out = self.out / (self.cfg.name + ".exe")
+        cmd = [ocra, str(entry), "--output", str(out), "--no-warnings"]
+        cmd.append("--window" if self.cfg.noconsole else "--console")
+        self.run(cmd, timeout=TIMEOUT_XLONG)
+        return self.emit([out])
+
+
+class PerlBuilder(BaseBuilder):
+    LANG = LangType.PERL
+    TOOL_LABEL = "PAR::Packer (pp)"
+
+    def build(self) -> List[Path]:
+        self.check_backend()
+        entry = self.cfg.need_entry()
+        self.deps.require(["perl", "pp"], purpose="Perl packaging")
+        if self.cfg.crossing:
+            warn("pp builds for the host OS only — cross-compilation is not supported.")
+        if self.cfg.add_data:
+            warn("--add-data is not applicable to PAR::Packer — ignored.")
+        pp = which_cmd("pp") or "pp"
+        out = self.out / (self.cfg.name + exe_ext(current_os()))
+        cmd = [pp, "-o", str(out)]
+        # [new] pp can embed a Win32 icon into the executable
+        if self.cfg.icon:
+            if current_os() == "windows" and self.cfg.icon.suffix.lower() == ".ico":
+                cmd += ["--icon", str(self.cfg.icon)]
+            else:
+                warn("--icon ignored: pp embeds icons only into Windows .ico builds.")
+        cmd.append(str(entry))
+        self.run(cmd, timeout=TIMEOUT_XLONG)
+        return self.emit([out])
+
+
+class LoveBuilder(BaseBuilder):
+    LANG = LangType.LOVE
+    TOOL_LABEL = "LÖVE package"
+
+    def build(self) -> List[Path]:
+        self.check_features(data=True)   # icons are set inside conf.lua
+        self.check_backend()
+        entry = self.cfg.need_entry()   # usually main.lua
+        love_path = self.out / f"{self.cfg.name}.love"
+        with zipfile.ZipFile(love_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in collect_files(self.project, extra_excludes={self.out.name}):
+                try:
+                    zf.write(f, f.relative_to(self.project).as_posix())
+                except (OSError, ValueError):
+                    continue
+            # [new] --add-data entries are packed into the .love archive
+            for src, dest in self.cfg.add_data:
+                if src.is_dir():
+                    for f in src.rglob("*"):
+                        if f.is_file():
+                            zf.write(f, f"{dest}/{f.relative_to(src).as_posix()}")
+                else:
+                    zf.write(src, dest)
+        arts = [love_path]
+        if self.cfg.target_os == "windows":
+            love_exe = which_cmd("love")
+            if love_exe and Path(love_exe).suffix.lower() == ".exe":
+                fused = self.out / f"{self.cfg.name}.exe"
+                shutil.copy2(love_exe, fused)
+                with open(love_path, "rb") as src, open(fused, "ab") as dst:
+                    shutil.copyfileobj(src, dst)
+                arts.append(fused)
+            else:
+                warn("love.exe not found — produced the .love package only.")
+        if entry.name != "main.lua":
+            warn(f"LÖVE expects main.lua at the archive root; detected entry is "
+                 f"'{self.cfg.entry}'.")
+        return self.emit(arts)
+
+
+class NativeCBuilder(BaseBuilder):
+    """C build: CMake -> Make -> direct compile (entry + sources without main)."""
+    LANG = LangType.C
+    COMPILER = "gcc"
+    COMPILER_WIN_CROSS = "x86_64-w64-mingw32-gcc"
+    SRC_EXTS = (".c",)
+    STD_FLAG = "-std=c11"
+    TOOL_LABEL = "gcc / CMake / Make"
+    SUPPORTED_BACKENDS = ("gcc", "clang", "g++", "clang++", "cmake")
+
+    def build(self) -> List[Path]:
+        self.check_features()   # compilers have no icon/data mechanism
+        self.check_backend()
+        backend = (getattr(self.cfg, "backend", "") or "").strip().lower()
+        # [toolbox compat] backend selects the compiler or forces CMake
+        self._backend_compiler = None
+        if backend in ("clang", "clang++"):
+            self._backend_compiler = "clang" if backend == "clang" else "clang++"
+        elif backend in ("gcc", "g++"):
+            self._backend_compiler = self.COMPILER
+        if (self.project / "CMakeLists.txt").exists():
+            return self._cmake_build()
+        if any((self.project / n).exists() for n in ("Makefile", "makefile", "GNUmakefile")):
+            return self._make_build()
+        return self._direct_build()
+
+    def _compiler(self) -> str:
+        backend_cc = getattr(self, "_backend_compiler", None)
+        if backend_cc and self.cfg.target_os == current_os():
+            return backend_cc          # backend compiler only for native builds
+        if self.cfg.target_os == "windows" and current_os() != "windows":
+            return self.COMPILER_WIN_CROSS
+        return self.COMPILER
+
+    def _direct_build(self) -> List[Path]:
+        entry = self.cfg.need_entry()
+        cc = self._compiler()
+        self.deps.require([cc], purpose=f"{self.LANG.value} compilation")
+        out = self.out / (self.cfg.name + exe_ext(self.cfg.target_os))
+        srcs = self._link_sources(entry)
+        cmd = [which_cmd(cc) or cc, "-O2", self.STD_FLAG,
+               str(entry)] + [str(s) for s in srcs] + ["-o", str(out)]
+        self.run(cmd, timeout=TIMEOUT_LONG)
+        return self.emit([out])
+
+    def _link_sources(self, entry: Path) -> List[Path]:
+        """[fix] link every source EXCEPT files that define their own main()
+        — prevents duplicate-symbol link errors on multi-file projects."""
+        rel = rel_files(collect_files(self.project, extra_excludes={self.out.name}),
+                        self.project)
+        out: List[Path] = []
+        for f in rel:
+            if f.suffix.lower() not in self.SRC_EXTS:
+                continue
+            p = self.project / f
+            if p == entry:
+                continue
+            if re.search(r"\b(?:int|void)\s+main\s*\(", read_small_text(p, 65536)):
+                continue
+            out.append(p)
+            if len(out) >= 200:
+                break
+        return out
+
+    def _cmake_build(self) -> List[Path]:
+        self.deps.require(["cmake"], purpose="CMake build")
+        bdir = self.project / ".polybuild_tmp" / "cmake"
+        self.run(["cmake", "-S", str(self.project), "-B", str(bdir),
+                  "-DCMAKE_BUILD_TYPE=Release"], timeout=TIMEOUT_MED)
+        self.run(["cmake", "--build", str(bdir), "--config", "Release", "--parallel"],
+                 timeout=TIMEOUT_XLONG)
+        arts = find_native_binaries(bdir, self.cfg.target_os)
+        if not arts:
+            raise BuildError("CMake build finished but no binaries were found.")
+        return self.emit([self.copy_to_out(pick_binary(arts, self.cfg))])
+
+    def _make_build(self) -> List[Path]:
+        tool = "make" if current_os() != "windows" else "mingw32-make"
+        self.deps.require([tool], purpose="Make build")
+        self.run([which_cmd(tool) or tool, "-j"], timeout=TIMEOUT_XLONG)
+        arts = [a for a in find_native_binaries(self.project, self.cfg.target_os)
+                if self.out.resolve() not in a.parents]
+        if not arts:
+            raise BuildError("make finished but no binaries were found.")
+        return self.emit([self.copy_to_out(pick_binary(arts, self.cfg))])
+
+
+class NativeCppBuilder(NativeCBuilder):
+    LANG = LangType.CPP
+    COMPILER = "g++"
+    COMPILER_WIN_CROSS = "x86_64-w64-mingw32-g++"
+    SRC_EXTS = (".cpp", ".cc", ".cxx")
+    STD_FLAG = "-std=c++17"
+    TOOL_LABEL = "g++ / CMake / Make"
+
+
+class RustBuilder(BaseBuilder):
+    LANG = LangType.RUST
+    TOOL_LABEL = "cargo build --release"
+    SUPPORTED_BACKENDS = ("cargo",)
+    TRIPLE = {"windows": "x86_64-pc-windows-gnu",
+              "linux": "x86_64-unknown-linux-gnu",
+              "macos": "x86_64-apple-darwin"}
+
+    def build(self) -> List[Path]:
+        self.check_features()   # icons/data are managed by the OS packaging layer
+        self.check_backend()
+        self.deps.require(["cargo"], purpose="Rust build")
+        cmd = ["cargo", "build", "--release"]
+        triple = None
+        if self.cfg.crossing:
+            triple = self.TRIPLE[self.cfg.target_os]
+            cmd += ["--target", triple]
+        self.run(cmd, timeout=TIMEOUT_XLONG)
+        search = self.project / "target" / (triple or "") / "release"
+        cand = search / (self.cfg.name + exe_ext(self.cfg.target_os))
+        if cand.exists():
+            return self.emit([self.copy_to_out(cand)])
+        # [fix] the crate name may differ from --name: search the folder for real
+        arts = find_native_binaries(search, self.cfg.target_os)
+        if not arts:
+            raise BuildError("cargo finished but no binary was found in target/release.")
+        return self.emit([self.copy_to_out(pick_binary(arts, self.cfg))])
+
+
+class GoBuilder(BaseBuilder):
+    LANG = LangType.GO
+    TOOL_LABEL = "go build"
+    SUPPORTED_BACKENDS = ("go",)
+    GOOS = {"windows": "windows", "linux": "linux", "macos": "darwin"}
+
+    def build(self) -> List[Path]:
+        self.check_features()
+        self.check_backend()
+        self.deps.require(["go"], purpose="Go build")
+        if self.cfg.target_os == "android":
+            raise BuildError("Plain 'go build' cannot target Android (use gomobile).")
+        goarch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "amd64"
+        env = {"GOOS": self.GOOS[self.cfg.target_os], "GOARCH": goarch,
+               "CGO_ENABLED": "0"}
+        out = self.out / (self.cfg.name + exe_ext(self.cfg.target_os))
+        # [fix] build the *package directory* of the detected entry, not ./...
+        entry = self.cfg.entry_path()
+        if entry is not None:
+            # [fix v3.3.1] relative_to can raise ValueError (symlinks / Windows
+            # case-insensitivity) — fall back to the whole-module build instead
+            # of crashing with a traceback.
+            try:
+                rel_dir = entry.parent.resolve().relative_to(self.project.resolve())
+                pkg = "." if str(rel_dir) == "." else "./" + rel_dir.as_posix()
+            except ValueError:
+                pkg = "."
+        else:
+            pkg = "." if (self.project / "main.go").exists() else "./..."
+        self.run(["go", "build", "-trimpath", "-ldflags", "-s -w",
+                  "-o", str(out), pkg], timeout=TIMEOUT_LONG, env=env)
+        return self.emit([out])
+
+
+class NimBuilder(BaseBuilder):
+    LANG = LangType.NIM
+    TOOL_LABEL = "nim compile"
+
+    def build(self) -> List[Path]:
+        self.check_features()
+        self.check_backend()
+        entry = self.cfg.need_entry()
+        self.deps.require(["nim"], purpose="Nim compilation")
+        out = self.out / (self.cfg.name + exe_ext(self.cfg.target_os))
+        cmd = ["nim", "compile", "--opt:speed", "-d:release", f"--out:{out}"]
+        if self.cfg.target_os == "windows" and current_os() != "windows":
+            self.deps.require(["x86_64-w64-mingw32-gcc"],
+                              purpose="Nim cross-compilation to Windows")
+            cmd += ["--cpu:amd64", "--os:windows"]
+        cmd.append(str(entry))
+        self.run(cmd, timeout=TIMEOUT_LONG)
+        return self.emit([out])
+
+
+class ZigBuilder(BaseBuilder):
+    LANG = LangType.ZIG
+    TOOL_LABEL = "zig build / build-exe"
+    TARGET = {"windows": "x86_64-windows", "linux": "x86_64-linux",
+              "macos": "x86_64-macos"}
+
+    def build(self) -> List[Path]:
+        self.check_features()
+        self.check_backend()
+        self.deps.require(["zig"], purpose="Zig build")
+        zig = which_cmd("zig") or "zig"
+        if (self.project / "build.zig").exists():
+            cmd = [zig, "build", "-Doptimize=ReleaseFast"]
+            if self.cfg.crossing:
+                cmd.append(f"-Dtarget={self.TARGET[self.cfg.target_os]}")
+            self.run(cmd, timeout=TIMEOUT_XLONG)
+            arts = find_native_binaries(self.project / "zig-out" / "bin",
+                                        self.cfg.target_os)
+            if not arts:
+                raise BuildError("zig build finished but zig-out/bin is empty.")
+            return self.emit([self.copy_to_out(pick_binary(arts, self.cfg))])
+        entry = self.cfg.need_entry()
+        out = self.out / (self.cfg.name + exe_ext(self.cfg.target_os))
+        cmd = [zig, "build-exe", str(entry), "-O", "ReleaseFast",
+               f"-femit-bin={out}"]
+        if self.cfg.crossing:
+            cmd += ["-target", self.TARGET[self.cfg.target_os]]
+        self.run(cmd, timeout=TIMEOUT_LONG)
+        return self.emit([out])
+
+
+class CrystalBuilder(BaseBuilder):
+    LANG = LangType.CRYSTAL
+    TOOL_LABEL = "crystal build --release"
+
+    def build(self) -> List[Path]:
+        self.check_features()
+        self.check_backend()
+        entry = self.cfg.need_entry()
+        self.deps.require(["crystal"], purpose="Crystal build")
+        if self.cfg.crossing:
+            raise BuildError("Crystal does not support cross-compiling executables "
+                             "from this host — build on the target OS instead.")
+        out = self.out / (self.cfg.name + exe_ext(self.cfg.target_os))
+        self.run(["crystal", "build", "--release", str(entry), "-o", str(out)],
+                 timeout=TIMEOUT_XLONG)
+        return self.emit([out])
+
+
+class DotnetBuilder(BaseBuilder):
+    LANG = LangType.DOTNET
+    TOOL_LABEL = "dotnet publish"
+    SUPPORTED_BACKENDS = ("dotnet",)
+    RID = {"windows": "win-x64", "linux": "linux-x64", "macos": "osx-x64"}
+
+    def build(self) -> List[Path]:
+        self.check_features(icon=True, data=True)
+        self.check_backend()
+        self.deps.require(["dotnet"], purpose=".NET build")
+        # [fix] .NET entry point = the project file (now detected)
+        proj = self.cfg.entry_path()
+        if proj is None or proj.suffix not in (".csproj", ".vbproj", ".fsproj") \
+                or not proj.exists():
+            cands = sorted((f for f in collect_files(self.project)
+                            if f.suffix in (".csproj", ".vbproj", ".fsproj")),
+                           key=lambda p: (len(p.relative_to(self.project).parts), p.name))
+            if not cands:
+                raise BuildError("No .csproj / .vbproj / .fsproj found in the project.")
+            proj = cands[0]
+        rid = self.RID.get(self.cfg.target_os)
+        publish_dir = self.out / "publish"
+        cmd = ["dotnet", "publish", str(proj), "-c", "Release",
+               "-o", str(publish_dir), "--nologo"]
+        if self.cfg.onefile:
+            cmd += ["--self-contained", "true", f"-r:{rid}",
+                    "-p:PublishSingleFile=true"]
+        elif self.cfg.crossing and rid:
+            cmd += [f"-r:{rid}"]
+        # [new] embed a Win32 icon into the produced .exe
+        if self.cfg.icon:
+            if self.cfg.target_os == "windows" and self.cfg.icon.suffix.lower() == ".ico":
+                cmd += [f"-p:ApplicationIcon={self.cfg.icon}"]
+            else:
+                warn("--icon ignored: .NET embeds icons only for Windows .exe (.ico).")
+        self.run(cmd, timeout=TIMEOUT_XLONG)
+        # [new] --add-data: copy the extra files into the publish folder
+        for src, dest in self.cfg.add_data:
+            target = publish_dir / dest
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir():
+                if target.exists():
+                    shutil.rmtree(target, ignore_errors=True)
+                shutil.copytree(src, target)
+            else:
+                shutil.copy2(src, target)
+        # [fix] the output is named after the project file, not after --name
+        exe_name = proj.stem + (".exe" if self.cfg.target_os == "windows" else "")
+        cand = publish_dir / exe_name
+        if not cand.exists():
+            cand = publish_dir / (proj.stem + ".dll")
+        return self.emit([cand])
+
+
+class JavaBuilder(BaseBuilder):
+    LANG = LangType.JAVA
+    TOOL_LABEL = "Maven / Gradle / javac"
+    SUPPORTED_BACKENDS = ("jpackage", "gradle", "maven")
+
+    def build(self) -> List[Path]:
+        # icon embedding needs the jpackage path, which is taken with -f
+        self.check_features(icon=self.cfg.onefile, data=False)
+        self.check_backend()
+        backend = (getattr(self.cfg, "backend", "") or "").strip().lower()
+        # [toolbox compat] backend steers the route when it exists in the
+        # project; otherwise the auto path below is used with a warning.
+        if backend == "maven" and (self.project / "pom.xml").exists():
+            return self._maven()
+        if backend == "gradle" and any(
+                f.name.startswith("build.gradle")
+                for f in collect_files(self.project, max_files=400)):
+            return self._gradle_jar()
+        if backend in ("maven", "gradle"):
+            warn(f"--backend {backend}: matching build files not found — "
+                 "auto-routing (pom.xml / build.gradle / javac).")
+        if backend == "jpackage":
+            # jpackage needs -f (onefile) to be taken
+            if not self.cfg.onefile:
+                info("--backend jpackage: enabling onefile (app-image packaging).")
+                self.cfg.onefile = True
+        if (self.project / "pom.xml").exists():
+            return self._maven()
+        if any(f.name.startswith("build.gradle")
+               for f in collect_files(self.project, max_files=400)):
+            return self._gradle_jar()
+        return self._javac()
+
+    def _maven(self) -> List[Path]:
+        self.deps.require(["java", "mvn"], purpose="Maven build")
+        mvn = which_cmd("mvn") or "mvn"
+        self.run([mvn, "-q", "-DskipTests", "package"], timeout=TIMEOUT_XLONG)
+        jars = [p for p in (self.project / "target").glob("*.jar")
+                if not p.name.endswith(("sources.jar", "javadoc.jar"))
+                and not p.name.startswith("original-")]
+        if not jars:
+            raise BuildError("Maven finished but no JAR was found in target/.")
+        jar = max(jars, key=lambda p: p.stat().st_mtime)
+        return self._maybe_jpackage(jar)
+
+    def _gradle_jar(self) -> List[Path]:
+        wrapper = self.project / ("gradlew.bat" if os.name == "nt" else "gradlew")
+        if wrapper.exists():
+            cmd = [str(wrapper)] if os.name == "nt" else ["sh", str(wrapper)]
+        else:
+            self.deps.require(["gradle"], purpose="Gradle build")
+            cmd = [which_cmd("gradle") or "gradle"]
+        self.run(cmd + ["--no-daemon", "jar"], timeout=TIMEOUT_XLONG)
+        # [fix] search build/ folders too (collect_files would skip them)
+        jars = [f for f in find_files_by_ext(self.project, ".jar")
+                if self.out.resolve() not in f.parents]
+        if not jars:
+            raise BuildError("Gradle finished but no JAR was produced.")
+        jar = max(jars, key=lambda p: p.stat().st_mtime)
+        return self._maybe_jpackage(jar)
+
+    def _javac(self) -> List[Path]:
+        self.deps.require(["java", "javac", "jar"], purpose="Java compilation")
+        entry = self.cfg.need_entry()
+        srcs = [f for f in collect_files(self.project)
+                if f.suffix == ".java" and self.out.resolve() not in f.parents][:150]
+        if entry not in srcs:
+            srcs.insert(0, entry)
+        classes = self.project / ".polybuild_tmp" / "classes"
+        classes.mkdir(parents=True, exist_ok=True)
+        javac = which_cmd("javac") or "javac"
+        self.run([javac, "-encoding", "utf-8", "-d", str(classes)]
+                 + [str(s) for s in srcs], timeout=TIMEOUT_LONG)
+        jar_out = self.out / f"{self.cfg.name}.jar"
+        jar_tool = which_cmd("jar") or "jar"
+        main_class = self._main_class(entry)
+        if main_class:
+            self.run([jar_tool, "--create", "--file", str(jar_out),
+                      "--main-class", main_class, "-C", str(classes), "."])
+        else:
+            self.run([jar_tool, "--create", "--file", str(jar_out),
+                      "-C", str(classes), "."])
+        return self._maybe_jpackage(jar_out)
+
+    def _main_class(self, entry: Optional[Path]) -> Optional[str]:
+        """Derive the fully-qualified main class from the entry file."""
+        if entry is None or not entry.exists():
+            return None
+        text = read_small_text(entry)
+        pkg = regex_first(text, r"^\s*package\s+([\w.]+)\s*;")
+        return f"{pkg}.{entry.stem}" if pkg else entry.stem
+
+    def _maybe_jpackage(self, jar: Path) -> List[Path]:
+        main_class = self._main_class(self.cfg.entry_path())
+        if self.cfg.onefile and main_class \
+                and self.deps.ensure("jpackage", purpose="native Java packaging"):
+            jp = which_cmd("jpackage") or "jpackage"
+            jp_cmd = [jp, "--name", self.cfg.name, "--type", "app-image",
+                      "--input", str(jar.parent), "--main-jar", jar.name,
+                      "--main-class", main_class, "--dest", str(self.out)]
+            # [new] package icon (.ico on Windows / .icns on macOS)
+            if self.cfg.icon:
+                jp_cmd += ["--icon", str(self.cfg.icon)]
+            self.run(jp_cmd, timeout=TIMEOUT_LONG)
+            img = self.out / self.cfg.name
+            if img.exists():
+                return self.emit([img])
+            exes = [p for p in self.out.rglob("*.exe") if p.is_file()]
+            if exes:
+                return self.emit(exes[:1])
+        if self.cfg.icon:
+            warn("--icon dropped: plain JARs cannot embed icons (needs jpackage + -f).")
+        return self.emit([jar])
+
+
+class KotlinBuilder(BaseBuilder):
+    LANG = LangType.KOTLIN
+    TOOL_LABEL = "kotlinc"
+
+    def build(self) -> List[Path]:
+        self.check_features()
+        self.check_backend()
+        self.deps.require(["java", "kotlinc"], purpose="Kotlin compilation")
+        entry = self.cfg.need_entry()
+        srcs = [f for f in collect_files(self.project)
+                if f.suffix == ".kt" and self.out.resolve() not in f.parents][:150]
+        if entry not in srcs:
+            srcs.insert(0, entry)
+        jar_out = self.out / f"{self.cfg.name}.jar"
+        kotlinc = which_cmd("kotlinc") or "kotlinc"
+        self.run([kotlinc] + [str(s) for s in srcs]
+                 + ["-include-runtime", "-d", str(jar_out)], timeout=TIMEOUT_XLONG)
+        # [fix] kotlinc does not set Main-Class — make the JAR actually runnable
+        if not self._set_main_class(jar_out, f"{entry.stem}Kt"):
+            self._set_main_class(jar_out, entry.stem)
+        return self.emit([jar_out])
+
+    def _set_main_class(self, jar_path: Path, main_class: str) -> bool:
+        jar_tool = which_cmd("jar") or "jar"
+        proc = run_cmd([jar_tool, "--update", "--file", str(jar_path),
+                        "--main-class", main_class],
+                       cwd=self.project, timeout=TIMEOUT_SHORT)
+        return proc.returncode == 0
+
+
+class ScalaBuilder(BaseBuilder):
+    LANG = LangType.SCALA
+    TOOL_LABEL = "scala-cli package"
+
+    def build(self) -> List[Path]:
+        self.check_features()
+        self.check_backend()
+        self.deps.require(["java", "scala-cli"], purpose="Scala build")
+        entry = self.cfg.need_entry()
+        out = self.out / (self.cfg.name + exe_ext(self.cfg.target_os))
+        sc = which_cmd("scala-cli") or "scala-cli"
+        self.run([sc, "--power", "package", "--assembly", str(entry),
+                  "-o", str(out), "--force"], timeout=TIMEOUT_XLONG)
+        return self.emit([out])
+
+
+class FlutterBuilder(BaseBuilder):
+    LANG = LangType.FLUTTER
+    TOOL_LABEL = "flutter build"
+    SUPPORTED_BACKENDS = ("flutter",)
+
+    def _out_base(self, t: str) -> Path:
+        candidates = {
+            "windows": ("build/windows/x64/runner/Release",
+                        "build/windows/arm64/runner/Release"),
+            "linux": ("build/linux/x64/release/bundle",
+                      "build/linux/arm64/release/bundle"),
+            "macos": ("build/macos/Build/Products/Release",),
+        }[t]
+        for sub in candidates:
+            p = self.project / sub
+            if p.exists():
+                return p
+        return self.project / candidates[0]
+
+    def build(self) -> List[Path]:
+        self.check_features()
+        self.check_backend()
+        hint("App icons for Flutter/Android are set in the native resource "
+             "folders (e.g. via the flutter_launcher_icons package).")
+        self.deps.require(["flutter"], purpose="Flutter build")
+        flutter = which_cmd("flutter") or "flutter"
+        t = self.cfg.target_os
+        if t == "android":
+            self.run([flutter, "build", "apk", "--release"], timeout=TIMEOUT_XLONG)
+            apks = [f for f in find_files_by_ext(self.project, ".apk")
+                    if self.out.resolve() not in f.parents]
+            if not apks:
+                raise BuildError("flutter build apk finished but no APK was found.")
+            apk = next((a for a in apks if a.name == "app-release.apk"),
+                       max(apks, key=lambda p: p.stat().st_mtime))
+            return self.emit([self.copy_to_out(apk)])
+        self.run([flutter, "build", t, "--release"], timeout=TIMEOUT_XLONG)
+        base = self._out_base(t)
+        if not base.exists():
+            raise BuildError(f"flutter build finished but the output folder is missing: {base}")
+        if t == "windows":
+            arts = list(base.glob("*.exe"))
+        elif t == "linux":
+            arts = [p for p in base.iterdir() if p.is_file() and p.suffix == ""]
+        else:
+            arts = [p for p in base.iterdir() if p.is_dir() and p.suffix == ".app"]
+        if not arts:
+            raise BuildError("flutter build produced no artifacts.")
+        return self.emit([self.copy_to_out(arts[0])])
+
+
+class DartBuilder(BaseBuilder):
+    LANG = LangType.DART
+    TOOL_LABEL = "dart compile exe"
+    SUPPORTED_BACKENDS = ("dart",)
+
+    def build(self) -> List[Path]:
+        self.check_features()
+        self.check_backend()
+        entry = self.cfg.need_entry()
+        self.deps.require(["dart"], purpose="Dart build")
+        if self.cfg.crossing:
+            raise BuildError("dart compile exe builds for the host OS only.")
+        dart = which_cmd("dart") or "dart"
+        out = self.out / (self.cfg.name + exe_ext(current_os()))
+        self.run([dart, "compile", "exe", str(entry), "-o", str(out)],
+                 timeout=TIMEOUT_XLONG)
+        return self.emit([out])
 
 
 class AndroidBuilder(BaseBuilder):
-    """Android عبر Gradle wrapper — يتحقق من JDK + Android SDK أولًا."""
     LANG = LangType.ANDROID
-    TITLE = "gradlew assemble"
+    TOOL_LABEL = "Gradle (assembleRelease)"
 
-    def _sdk_dir(self) -> Optional[Path]:
-        env = os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME")
-        if env and Path(env).exists():
-            return Path(env)
-        lp = self.project / "local.properties"
-        sdk = regex_first(read_small_text(lp), r"sdk\.dir\s*=\s*(.+)")
-        if sdk and Path(sdk.strip()).exists():
-            return Path(sdk.strip())
-        return None
-
-    def _compile(self) -> Path:
-        gradlew = self.project / ("gradlew.bat" if os.name == "nt" else "gradlew")
-        if not gradlew.exists():
-            raise BuildError("لا يوجد gradle wrapper في المشروع — افتح المشروع في "
-                             "Android Studio مرة واحدة لتوليده، أو ثبّت gradle يدويًا.")
-        if not which_cmd("java"):
-            raise BuildError("بناء Android يحتاج JDK 17+:\n"
-                             "    sudo apt-get install -y openjdk-17-jdk")
-        if not self._sdk_dir():
-            raise BuildError("لم أعثر على Android SDK — ثبّت Android Studio أو cmdline-tools "
-                             "ثم اضبط ANDROID_SDK_ROOT أو local.properties (sdk.dir).")
-        cmd = self._invoke(gradlew) + ["assembleRelease", "--console=plain", "-q"]
-        proc = run_cmd(cmd, cwd=self.project, timeout=TIMEOUT_LONG)
-        apk_dir = self.project / "app/build/outputs/apk/release"
-        apk = self._newest_apk(apk_dir)
-        if not apk:
-            # [إصلاح] فشل التوقيع شائع → نجرّب debug تلقائيًا بشفافية
-            warn("لم أجد APK release (غالبًا غياب keystore التوقيع) — سأبني debug.")
-            self._run(self._invoke(gradlew) + ["assembleDebug", "--console=plain", "-q"],
-                      timeout=TIMEOUT_LONG)
-            apk = self._newest_apk(self.project / "app/build/outputs/apk/debug")
-        if not apk:
-            raise BuildError("فشل بناء APK:\n" + tail_lines((proc.stderr or "") +
-                                                             (proc.stdout or ""), 6))
-        return self._copy_into(apk, self.out)
-
-    def _invoke(self, gradlew: Path) -> List[str]:
-        if os.name == "nt":
-            return [str(gradlew)]
-        return [str(gradlew)] if os.access(gradlew, os.X_OK) else ["sh", str(gradlew)]
-
-    def _newest_apk(self, folder: Path) -> Optional[Path]:
-        if not folder.exists():
-            return None
-        apks = [f for f in folder.rglob("*.apk") if f.is_file()]
-        return max(apks, key=lambda f: f.stat().st_mtime, default=None)
-
-    def _update_project_deps(self) -> None:
-        gradlew = self.project / ("gradlew.bat" if os.name == "nt" else "gradlew")
-        if gradlew.exists():
-            self._run(self._invoke(gradlew) + ["--refresh-dependencies"],
-                      timeout=TIMEOUT_PKG)
+    def build(self) -> List[Path]:
+        self.check_features()
+        self.check_backend()
+        wrapper = self.project / ("gradlew.bat" if os.name == "nt" else "gradlew")
+        if wrapper.exists():
+            cmd = [str(wrapper)] if os.name == "nt" else ["sh", str(wrapper)]
+        else:
+            self.deps.require(["gradle"], purpose="Android build")
+            cmd = [which_cmd("gradle") or "gradle"]
+        self.run(cmd + ["assembleRelease"], timeout=TIMEOUT_XLONG)
+        # [fix] build/ is a normal excluded folder — search it explicitly
+        apks = [f for f in find_files_by_ext(self.project, ".apk")
+                if self.out.resolve() not in f.parents]
+        if not apks:
+            raise BuildError("Gradle finished but no APK was found under build/outputs.")
+        apk = next((a for a in apks if a.name == "app-release.apk"),
+                   max(apks, key=lambda p: p.stat().st_mtime))
+        return self.emit([self.copy_to_out(apk)])
 
 
 class GodotBuilder(BaseBuilder):
-    """Godot عبر export_presets.cfg — يحتاج قوالب التصدير مثبتة."""
     LANG = LangType.GODOT
-    TITLE = "godot --export-release"
+    TOOL_LABEL = "godot --export-release"
+    PRESET_BY_OS = {"windows": "Windows Desktop", "linux": "Linux/X11",
+                    "macos": "macOS", "android": "Android"}
+    EXT_BY_OS = {"windows": ".exe", "linux": ".x86_64", "macos": ".zip",
+                 "android": ".apk"}
 
-    def _compile(self) -> Path:
-        self._require(["godot"], purpose="تصدير Godot")
-        presets_file = self.project / "export_presets.cfg"
-        text = read_small_text(presets_file)
-        if not text:
-            raise BuildError("لا يوجد export_presets.cfg — افتح المشروع في محرر Godot "
-                             "وأضف Export Preset أولًا (Project → Export).")
-        presets = re.findall(r'name="([^"]+)"', text)
-        if not presets:
-            raise BuildError("export_presets.cfg بلا presets — أنشئ preset واحد على الأقل.")
-        wanted = {"windows": "Windows", "android": "Android", "linux": "Linux",
-                  "macos": "macOS"}.get(self.target_os, "")
-        preset = next((p for p in presets if wanted and wanted.lower() in p.lower()), presets[0])
-        ext = ".apk" if "android" in preset.lower() else exe_ext(
-            "windows" if "windows" in preset.lower() else self.target_os)
-        out = self.out / (self.name + ext)
-        info(f"تصدير preset: {preset}")
-        self._run([which_cmd("godot") or "godot", "--headless", "--export-release",
-                   preset, str(out)], timeout=TIMEOUT_LONG)
-        if not out.exists():
-            raise BuildError("التصدير اكتمل بدون ملف — تحقق من تثبيت Export Templates "
-                             "بنفس إصدار Godot.")
-        return out
-
-
-# ── لغات "كشف بدون بناء": إرشاد واضح بدل ادعاء ناتج زائف ──────────────────
-
-class _GuidanceBuilder(BaseBuilder):
-    """لا يبني — يعرض خطوات البناء الرسمية بوضوح (لا ملفات مضللة)."""
-
-    def _compile(self) -> Path:
-        raise GuidanceBuild(self.GUIDE_TITLE, self.GUIDE_STEPS)
-
-
-class UnityBuilder(_GuidanceBuilder):
-    LANG = LangType.UNITY
-    TITLE = "Unity Editor (إرشاد)"
-    GUIDE_TITLE = "مشاريع Unity تُبنى عبر المحرر الرسمي"
-    GUIDE_STEPS = [
-        "1. افتح المشروع في Unity Hub/Editor.",
-        "2. File → Build Settings واختر المنصة المستهدفة.",
-        "3. اضغط Build وحدد مجلد الإخراج.",
-        "4. للأتمتة: unity -batchmode -quit -executeMethod BuildScript.PerformBuild",
-    ]
+    def build(self) -> List[Path]:
+        self.check_features()   # the icon is a project setting inside Godot
+        self.check_backend()
+        presets = self.project / "export_presets.cfg"
+        if not presets.exists():
+            raise GuidanceBuild(
+                "Godot exports require export presets",
+                ["Open the project in the Godot editor.",
+                 "Project -> Export... -> Add and configure a preset for your target platform.",
+                 "Save export_presets.cfg, then re-run PolyBuild."])
+        self.deps.require(["godot"], purpose="Godot export")
+        wanted = self.PRESET_BY_OS.get(self.cfg.target_os)
+        if not wanted:
+            raise BuildError(f"Unsupported Godot target: {self.cfg.target_os}")
+        names = re.findall(r'^name\s*=\s*"([^"]+)"', read_small_text(presets), re.M)
+        preset = next((n for n in names if n.lower() == wanted.lower()), None)
+        if preset is None:
+            if not names:
+                raise BuildError("export_presets.cfg contains no export presets.")
+            raise BuildError(f"No preset for '{wanted}'. Available: {', '.join(names)}")
+        out = self.out / (self.cfg.name + self.EXT_BY_OS.get(self.cfg.target_os, ""))
+        godot = which_cmd("godot") or "godot"
+        # Godot 4 uses --export-release; fall back to Godot 3's --export
+        proc = run_cmd([godot, "--headless", "--export-release", preset,
+                        str(out), "project.godot"],
+                       cwd=self.project, timeout=TIMEOUT_XLONG)
+        if proc.returncode != 0:
+            proc = run_cmd([godot, "--headless", "--export", preset,
+                            str(out), "project.godot"],
+                           cwd=self.project, timeout=TIMEOUT_XLONG)
+            if proc.returncode != 0:
+                raise BuildError("Godot export failed:\n"
+                                 + tail_lines((proc.stdout or "") + (proc.stderr or ""), 8))
+        return self.emit([out])
 
 
-class UnrealBuilder(_GuidanceBuilder):
-    LANG = LangType.UNREAL
-    TITLE = "Unreal Editor (إرشاد)"
-    GUIDE_TITLE = "مشاريع Unreal تُبنى عبر المحرر/البناء الرسمي"
-    GUIDE_STEPS = [
-        "1. افتح المشروع في Unreal Editor أو استخدم UnrealBuildTool.",
-        "2. Packaging: Platforms → <المنصة> → Package Project.",
-        "3. للأتمتة: RunUAT.bat BuildCookRun -project=... -platform=Win64 -cook -allmaps -build -stage -pak -archive",
-    ]
+class GuidanceBuilder(BaseBuilder):
+    """For project types that have no CLI build path — emits manual steps."""
+    TOOL_LABEL = "Guidance"
+
+    def __init__(self, cfg: BuildConfig, deps: DependencyManager,
+                 title: str, steps: List[str]):
+        super().__init__(cfg, deps)
+        self._title = title
+        self._steps = steps
+
+    def build(self) -> List[Path]:
+        raise GuidanceBuild(self._title, self._steps)
 
 
-class GameMakerBuilder(_GuidanceBuilder):
-    LANG = LangType.GAMEMAKER
-    TITLE = "GameMaker (إرشاد)"
-    GUIDE_TITLE = "مشاريع GameMaker تُبنى عبر IDE الرسمي"
-    GUIDE_STEPS = [
-        "1. افتح المشروع (.yyp) في GameMaker IDE.",
-        "2. اختر Target (Windows/Mac/HTML5/Android).",
-        "3. Create Executable / Package وحدد مجلد الإخراج.",
-    ]
+def _guidance_factory(title: str, steps: List[str]) -> Callable:
+    def factory(cfg: BuildConfig, deps: DependencyManager) -> GuidanceBuilder:
+        return GuidanceBuilder(cfg, deps, title, steps)
+    return factory
 
 
-class RenPyBuilder(_GuidanceBuilder):
-    LANG = LangType.RENPY
-    TITLE = "Ren'Py SDK (إرشاد)"
-    GUIDE_TITLE = "مشاريع Ren'Py توزَّع عبر Ren'Py Launcher"
-    GUIDE_STEPS = [
-        "1. افتح المشروع في Ren'Py Launcher.",
-        "2. Build Distributions واختر المنصات (Linux/Mac/Windows).",
-        "3. اضغط Build — ستحصل على حزم توزيع جاهزة.",
-    ]
+GUIDANCE: Dict[LangType, Tuple[str, List[str]]] = {
+    LangType.PHP: (
+        "PHP is packaged into a self-contained .phar with Box",
+        ["Install Box: grab the .phar from"
+         " https://github.com/box-project/box/releases"
+         " (or: composer require --dev humbug/box).",
+         "Create box.json.dist next to your entry file, e.g.:"
+         ' {"main": "index.php", "output": "app.phar"}',
+         "Run: box compile  — this produces the self-contained app.phar.",
+         "Optional native-style launcher: prepend a shebang stub"
+         " (#!/usr/bin/env php) to the .phar and mark it executable.",
+         "PHP cannot be compiled to a machine-code .exe — the .phar plus a"
+         " PHP runtime is the standard distribution model."]),
+    LangType.UNITY: (
+        "Unity projects are built from the Unity Editor",
+        ["Open the project in Unity Hub (Add -> select the project folder).",
+         "File -> Build Settings -> add your scenes -> choose the target platform.",
+         "Click Build and pick an output folder.",
+         "For CI automation use: Unity -batchmode -quit -projectPath <path> "
+         "-executeMethod YourBuildScript.Build"]),
+    LangType.UNREAL: (
+        "Unreal Engine projects are built via UnrealBuildTool",
+        ["Right-click the .uproject -> Generate project files (Windows), or run "
+         "GenerateProjectFiles.sh (Linux).",
+         "Open the generated solution/workspace and build the Shipping config.",
+         "Or from the command line: RunUAT BuildCookRun -project=<path>.uproject "
+         "-platform=Win64 -build -cook -stage"]),
+    LangType.GAMEMAKER: (
+        "GameMaker projects are built from the IDE",
+        ["Open the .yyp project in GameMaker Studio 2.",
+         "Use the Target Manager to pick a platform (Windows VM or YYC).",
+         "Create -> Create Executable to produce the .exe."]),
+    LangType.RENPY: (
+        "Ren'Py games are packaged from the Ren'Py Launcher",
+        ["Open the game folder with the Ren'Py Launcher.",
+         "Click 'Build Distributions'.",
+         "Choose the target (Windows/Linux/macOS/Android/web) and build."]),
+    LangType.LUA: (
+        "Plain Lua cannot compile to a native executable on its own",
+        ["Wrap the game with LÖVE: put a conf.lua next to main.lua and re-run "
+         "with --lang love.",
+         "Or use srlua / lua2c to glue the interpreter to your script.",
+         "Or ship the script together with a Lua interpreter."]),
+}
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 12) BUILDERS factory — خريطة اللغة → البنّاء
-# ═══════════════════════════════════════════════════════════════════════════
-
-BUILDERS: Dict[LangType, type] = {
+BUILDER_REGISTRY: Dict[LangType, Callable[[BuildConfig, DependencyManager], BaseBuilder]] = {
     LangType.PYTHON: PythonBuilder,
     LangType.NODE: NodeBuilder,
+    LangType.ELECTRON: ElectronBuilder,
     LangType.RUBY: RubyBuilder,
     LangType.PERL: PerlBuilder,
-    LangType.LUA: LuaBuilder,
     LangType.LOVE: LoveBuilder,
-    LangType.C: CBuilder,
-    LangType.CPP: CppBuilder,
+    LangType.C: NativeCBuilder,
+    LangType.CPP: NativeCppBuilder,
     LangType.RUST: RustBuilder,
     LangType.GO: GoBuilder,
     LangType.NIM: NimBuilder,
@@ -2403,409 +2618,361 @@ BUILDERS: Dict[LangType, type] = {
     LangType.SCALA: ScalaBuilder,
     LangType.FLUTTER: FlutterBuilder,
     LangType.DART: DartBuilder,
-    LangType.ELECTRON: ElectronBuilder,
     LangType.ANDROID: AndroidBuilder,
     LangType.GODOT: GodotBuilder,
-    LangType.UNITY: UnityBuilder,
-    LangType.UNREAL: UnrealBuilder,
-    LangType.GAMEMAKER: GameMakerBuilder,
-    LangType.RENPY: RenPyBuilder,
+    LangType.PHP: _guidance_factory(*GUIDANCE[LangType.PHP]),
+    LangType.UNITY: _guidance_factory(*GUIDANCE[LangType.UNITY]),
+    LangType.UNREAL: _guidance_factory(*GUIDANCE[LangType.UNREAL]),
+    LangType.GAMEMAKER: _guidance_factory(*GUIDANCE[LangType.GAMEMAKER]),
+    LangType.RENPY: _guidance_factory(*GUIDANCE[LangType.RENPY]),
+    LangType.LUA: _guidance_factory(*GUIDANCE[LangType.LUA]),
 }
 
-# ترتيب عرض القوائم التفاعلية
-LANG_ORDER: List[LangType] = [k for k in BUILDERS.keys() if k is not LangType.UNKNOWN]
+# Languages whose build cannot proceed at all without an explicit entry point
+ENTRY_REQUIRED_LANGS = {
+    LangType.PYTHON, LangType.NODE, LangType.ELECTRON, LangType.RUBY,
+    LangType.PERL, LangType.LOVE, LangType.NIM, LangType.CRYSTAL,
+    LangType.DART, LangType.KOTLIN, LangType.SCALA,
+}
+
+# [new] Language inference for -s/--src (single-file mode): extension -> language
+SRC_EXT_LANG: Dict[str, LangType] = {
+    ".py": LangType.PYTHON,
+    ".js": LangType.NODE, ".mjs": LangType.NODE, ".cjs": LangType.NODE, ".ts": LangType.NODE,
+    ".rb": LangType.RUBY, ".pl": LangType.PERL, ".lua": LangType.LUA,
+    ".c": LangType.C, ".cpp": LangType.CPP, ".cc": LangType.CPP, ".cxx": LangType.CPP,
+    ".rs": LangType.RUST, ".go": LangType.GO, ".nim": LangType.NIM, ".zig": LangType.ZIG,
+    ".cr": LangType.CRYSTAL, ".cs": LangType.DOTNET, ".java": LangType.JAVA,
+    ".kt": LangType.KOTLIN, ".scala": LangType.SCALA, ".dart": LangType.DART,
+    ".php": LangType.PHP,
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# [toolbox compat] language aliases + backend validation
+# ═══════════════════════════════════════════════════════════════════════
+
+# toolbox --lang name -> canonical handling. "javascript"/"typescript" are
+# resolved smartly (Electron when package.json declares electron, Node otherwise).
+LANG_ALIASES: Dict[str, str] = {
+    "js": "javascript", "ts": "typescript", "cs": "csharp",
+    "csharp": "dotnet", "javascript": "javascript", "typescript": "typescript",
+    "node": "node", "dotnet": "dotnet", "php": "php",
+}
+LANG_CHOICES = ([l.value for l in LangType if l is not LangType.UNKNOWN]
+                + ["javascript", "typescript", "csharp"])
+
+# every --backend value Ultimate Toolbox Pro can send (+ the canonical ones)
+KNOWN_BACKENDS = {
+    "auto", "-", "pyinstaller", "nuitka", "cx_freeze", "jpackage",
+    "gradle", "maven", "pkg", "nexe", "electron-builder",
+    "gcc", "clang", "g++", "clang++", "cmake", "dotnet", "go",
+    "cargo", "flutter", "dart", "ocra", "box",
+}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 13) InteractiveUI — المعالج التفاعلي
-# ═══════════════════════════════════════════════════════════════════════════
-
-class InteractiveUI:
-    """معالج تفاعلي: قوائم أسهم ↑/↓ على TTY، مرقّمة على CI،
-    قيمة افتراضية ذكية لكل حقل، Esc للإلغاء، وصندوق ملخص قبل التأكيد."""
-
-    def __init__(self, opts: argparse.Namespace):
-        self.opts = opts
-
-    # ---------- إدخال منخفض المستوى ----------
-    def _getch(self) -> str:
-        """قراءة مفتاح واحد موحّدة: msvcrt على Windows، termios على Unix،
-        input() عند غياب TTY."""
-        if os.name == "nt":
-            try:
-                import msvcrt
-                ch = msvcrt.getwch()
-                if ch in ("\x00", "\xe0"):
-                    nxt = msvcrt.getwch()
-                    return {"H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT"}.get(nxt, "")
-                return ch
-            except Exception:
-                return "\n"
-        try:
-            import termios
-            import tty
-            fd = sys.stdin.fileno()
-            old = termios.tcgetattr(fd)
-            tty.setraw(fd)
-            try:
-                ch = sys.stdin.read(1)
-                if ch == "\x1b":
-                    r, _, _ = select.select([sys.stdin], [], [], 0.05)
-                    if r:
-                        seq = sys.stdin.read(2)
-                        if seq == "[A":
-                            return "UP"
-                        if seq == "[B":
-                            return "DOWN"
-                    return "\x1b"
-                return ch
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        except Exception:
-            return "\n"
-
-    @staticmethod
-    def _tty() -> bool:
-        try:
-            return sys.stdin.isatty() and sys.stdout.isatty()
-        except Exception:
-            return False
-
-    # ---------- عناصر واجهة ----------
-    def menu(self, title: str, options: Sequence[str], default: int = 0) -> int:
-        """قائمة أسهم على TTY، مرقّمة على CI — تُرجع فهرس الاختيار."""
-        if not self._tty() or not COLOR:
-            return self._numbered_menu(title, options, default)
-        n = len(options)
-        idx = max(0, min(default, n - 1))
-        print(paint(f"◆ {title}", Ansi.CYAN, Ansi.BOLD))
-        body = [f"  {options[i]}" for i in range(n)]
-
-        def render() -> None:
-            for i, line in enumerate(body):
-                cur = (i == idx)
-                mark = paint(SYM["cursor"] + " ", Ansi.CYAN, Ansi.BOLD) if cur else "  "
-                txt = paint(line, Ansi.BOLD) if cur else paint(line, Ansi.GRAY)
-                print(mark + txt)
-
-        render()
-        while True:
-            ch = self._getch()
-            if ch == "UP":
-                idx = (idx - 1) % n
-            elif ch == "DOWN":
-                idx = (idx + 1) % n
-            elif ch in ("\r", "\n"):
-                return idx
-            elif ch == "\x1b":
-                raise UserCancel()
-            elif ch == "\x03":          # Ctrl+C في الوضع الخام
-                raise UserCancel()
-            else:
-                continue
-            sys.stdout.write(f"\x1b[{n}A\r\x1b[J")
-            sys.stdout.flush()
-            render()
-
-    def _numbered_menu(self, title: str, options: Sequence[str], default: int) -> int:
-        print(paint(f"◆ {title}", Ansi.CYAN, Ansi.BOLD))
-        for i, opt in enumerate(options):
-            mark = paint(" ← الافتراضي", Ansi.GRAY) if i == default else ""
-            print(f"  {i + 1}) {opt}{mark}")
-        while True:
-            try:
-                raw = input(f"اختر رقمًا [{default + 1}]: ").strip()
-            except EOFError:
-                return default
-            if not raw:
-                return default
-            if raw.isdigit() and 1 <= int(raw) <= len(options):
-                return int(raw) - 1
-            warn("رقم غير صالح — أعد المحاولة.")
-
-    def ask(self, prompt: str, default: str = "") -> str:
-        if not self._tty():
-            print(paint(f"◆ {prompt}", Ansi.CYAN, Ansi.BOLD))
-        try:
-            raw = input(f"{prompt}" + (f" [{default}]" if default else "") + ": ").strip()
-        except EOFError:
-            return default
-        return raw or default
-
-    def confirm(self, prompt: str, default: bool = True) -> bool:
-        if getattr(self.opts, "yes", False):   # [إصلاح] dest = yes وليس assume_yes
-            return True
-        suffix = "[Y/n]" if default else "[y/N]"
-        if not self._tty():
-            print(paint(f"◆ {prompt} {suffix}", Ansi.CYAN, Ansi.BOLD))
-            return default      # CI بدون إجابة → الافتراضي الآمن
-        try:
-            raw = input(f"{prompt} {suffix}: ").strip().lower()
-        except EOFError:
-            return default
-        if not raw:
-            return default
-        return raw in ("y", "yes", "1", "نعم")
-
-    # ---------- المعالج ----------
-    def run(self) -> None:
-        opts = self.opts
-        print()
-        render_box("المعالج التفاعلي — PolyBuild Pro",
-                   ["أدخل القيم أو اضغط Enter لقبول الافتراضي.",
-                    "Esc في أي قائمة للإلغاء."], width=58)
-        print()
-
-        # 1) مجلد المشروع
-        project_str = self.ask("مجلد المشروع", getattr(opts, "project", "") or ".")
-        project = Path(project_str).expanduser().resolve()
-        while not project.is_dir():
-            warn("المجلد غير موجود — حاول مرة أخرى (Esc للإلغاء).")
-            project_str = self.ask("مجلد المشروع", ".")
-            project = Path(project_str).expanduser().resolve()
-        opts.project = str(project)
-
-        # 2) معاينة الكشف قبل القرار
-        info("جارٍ فحص المشروع …")
-        det = ProjectDetector(project).detect()
-        rows = [("اللغة المرشّحة", det.label),
-                ("الثقة", f"{det.confidence * 100:.0f}%"),
-                ("الأدلة", "؛ ".join(det.evidence[:3]) or "لا شيء")]
-        if det.entry_point:
-            rows.append(("نقطة الدخول", det.entry_point))
-        render_box("نتيجة الكشف التلقائي", rows, width=62)
-        print()
-
-        # 3) اللغة: كشف تلقائي أو اختيار يدوي
-        langs = [LANG_LABELS[l] for l in LANG_ORDER]
-        auto_label = f"كشف تلقائي — {det.label} ({det.confidence * 100:.0f}%)" \
-            if det.lang is not LangType.UNKNOWN else "كشف تلقائي (لم أتأكد)"
-        idx = self.menu("اختر اللغة:", [auto_label] + langs,
-                        default=0 if det.lang is LangType.UNKNOWN else 0)
-        if idx == 0:
-            opts.lang = None                      # كشف تلقائي
-            if det.lang is LangType.UNKNOWN:
-                warn("الكشف لم يستقر — سيلزم --lang لاحقًا أو اختر من القائمة.")
-                idx = self.menu("اختر اللغة يدويًا:", langs, default=0)
-                opts.lang = LANG_ORDER[idx].value
-        else:
-            opts.lang = LANG_ORDER[idx - 1].value
-        lang = LangType(opts.lang) if opts.lang else det.lang
-
-        # 4) بقية الحقول بقيم ذكية
-        opts.output = self.ask("مجلد المخرجات", str(opts.output or DEFAULT_OUTPUT_DIR))
-        opts.name = self.ask("اسم المخرَج", det.project_name or sanitize_name(project.name))
-        entry_default = det.entry_point or ""
-        entry_in = self.ask("نقطة الدخول (اختياري)", entry_default)
-        opts.script = entry_in or None
-        os_idx = self.menu("النظام الهدف:", ["native (النظام الحالي)", "windows", "linux",
-                                             "macos", "android"], default=0)
-        opts.target_os = ["native", "windows", "linux", "macos", "android"][os_idx]
-        opts.onefile = self.confirm("ملف تنفيذي واحد؟ (--onefile)", True)
-        opts.console = self.confirm("إظهار نافذة console؟", True)
-        icon_in = self.ask("أيقونة (.ico/.png/.icns) — اختياري", "")
-        opts.icon = icon_in or None
-        if lang is LangType.PYTHON:
-            be = self.menu("محرك بناء Python:", ["auto (اختر المتوفر)", "pyinstaller", "nuitka"], 0)
-            opts.backend = ["auto", "pyinstaller", "nuitka"][be]
-
-        # 5) ملخص في صندوق قبل التأكيد
-        print()
-        render_box("ملخص الإعداد", [
-            ("المشروع", str(project)),
-            ("اللغة", LANG_LABELS.get(lang, str(opts.lang))),
-            ("الاسم", str(opts.name)),
-            ("المخرجات", str(opts.output)),
-            ("الدخول", str(opts.script or "-")),
-            ("الهدف", str(opts.target_os)),
-            ("onefile", "نعم" if opts.onefile else "لا"),
-            ("console", "نعم" if opts.console else "لا"),
-        ], width=62)
-        if not self.confirm("هل نبدأ البناء؟", True):
-            raise UserCancel()
+def normalize_lang_choice(value: str, detector: ProjectDetector) -> LangType:
+    """Map a --lang value (canonical or toolbox alias) onto a LangType."""
+    v = (value or "").strip().lower()
+    v = LANG_ALIASES.get(v, v)
+    if v in ("javascript", "typescript"):
+        # javascript/typescript: honor Electron projects — the toolbox
+        # detector reports both under these two names.
+        flags = detector._package_json_flags()
+        return LangType.ELECTRON if flags.get("electron") else LangType.NODE
+    return LangType(v)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 14) build_arg_parser()
+# 12) CLI — everything driven by flags, zero prompts
 # ═══════════════════════════════════════════════════════════════════════════
 
-def build_arg_parser() -> argparse.ArgumentParser:
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="polybuild.py",
-        description=f"{TOOL_NAME} {VERSION_TAG} — من أي مشروع برمجي إلى ملف تنفيذي أصلي "
-                    "(EXE / APK / Binary) مع كشف تلقائي وتثبيت تبعيات.",
+        prog="polybuild",
+        description=f"{TOOL_NAME} {VERSION} — turn any project into a native executable.",
+        epilog=(
+            "examples:\n"
+            "  polybuild.py ./myapp -n myapp                     # positional (toolbox style)\n"
+            "  polybuild.py -p ./myapp -n myapp\n"
+            "  polybuild.py -p . --lang python --onefile --entry src/app.py\n"
+            "  polybuild.py -s tools/app.py --icon assets/app.ico\n"
+            "  polybuild.py -p . -f --add-data assets:assets --add-data README.md:.\n"
+            "  polybuild.py -p . --target windows                # cross-compile (where supported)\n"
+            "  polybuild.py -p . --backend nuitka --hidden-import requests\n"
+            "  polybuild.py -p . --lang rust --auto-install\n"
+            "  polybuild.py --check-tools | --list-langs | --update\n"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="أمثلة:\n"
-               "  python polybuild.py -p ./myapp -n myapp -f\n"
-               "  python polybuild.py -p . --lang go --target-os windows\n"
-               "  python polybuild.py --check-tools\n"
-               "  python polybuild.py --update\n")
-    # الأساسية
-    p.add_argument("-p", "--project", metavar="DIR", help="مجلد المشروع")
-    p.add_argument("-s", "--script", metavar="FILE", help="نقطة الدخول (اختياري)")
-    p.add_argument("-n", "--name", metavar="NAME", help="اسم المخرَج")
-    p.add_argument("-i", "--icon", metavar="FILE", help="ملف .ico / .png / .icns")
-    p.add_argument("-o", "--output", metavar="DIR", default=None,
-                   help="مجلد المخرجات (افتراضي: dist داخل المشروع)")
-    p.add_argument("--lang", metavar="LANG",
-                   help="فرض اللغة (يتخطى الكشف) — مثل: python, go, cpp, flutter")
-    p.add_argument("--target-os", choices=TARGET_OS_CHOICES, default="native",
-                   help="نظام الهدف: native / windows / android (والأكثر)")
-    # التحكم بالبناء
+    )
+    p.add_argument("project_pos", nargs="?", default=None, metavar="PROJECT",
+                   help="project directory or single source file (same as -p; "
+                        "given first for toolbox compatibility)")
+    p.add_argument("-p", "--project", default=".",
+                   help="project directory (default: current directory)")
+    p.add_argument("-n", "--name", help="output artifact name (default: auto-detected)")
+    p.add_argument("-l", "--lang",
+                   choices=LANG_CHOICES,
+                   help="force the project language instead of auto-detection "
+                        "(toolbox aliases accepted: javascript, typescript, csharp)")
+    p.add_argument("-e", "--entry", metavar="PATH",
+                   help="explicit entry point, relative to the project root")
+    p.add_argument("-s", "--src", metavar="FILE",
+                   help="build this single source file directly: it becomes the "
+                        "entry point, its folder becomes the project root (unless "
+                        "-p is given), and the language is inferred from its "
+                        "extension (exclusive with -e)")
+    p.add_argument("--icon", metavar="PATH",
+                   help="application icon: .ico (Windows), .icns (macOS), "
+                        ".png (Electron); passed to the toolchain when supported")
+    p.add_argument("--add-data", metavar="SRC[:DEST]", action="append",
+                   help="bundle extra files/folders into the build; repeatable. "
+                        "DEST is inside the bundle (default: the source name). "
+                        "Also accepts SRC;DEST — Windows-drive-safe")
+    p.add_argument("--hidden-import", metavar="MODULE", dest="hidden_imports",
+                   action="append",
+                   help="Python only: extra hidden import for PyInstaller "
+                        "(--hidden-import) / Nuitka (--include-module); repeatable")
     p.add_argument("-f", "--onefile", action="store_true",
-                   help="ملف تنفيذي واحد")
-    p.add_argument("-c", "--console", action=argparse.BooleanOptionalAction, default=True,
-                   help="إظهار نافذة console (استخدم --no-console لإخفائها)")
-    p.add_argument("--devtools", action="store_true",
-                   help="فتح DevTools في Electron (يتطلب دعمًا في main.js)")
-    p.add_argument("--backend", choices=("auto", "pyinstaller", "nuitka"), default="auto",
-                   help="محرك بناء Python")
-    # المتقدمة
-    p.add_argument("--hidden-imports", action="append", default=[], metavar="MOD",
-                   help="وحدات مخفية (قابلة للتكرار)")
-    p.add_argument("--add-data", action="append", default=[], metavar="SRC=DEST",
-                   help="ملفات بيانات SRC=DEST (قابلة للتكرار)")
-    # الإدارة
-    p.add_argument("--update", action="store_true", help="تحديث PolyBuild نفسه")
-    p.add_argument("--update-deps", action="store_true", help="تحديث تبعيات المشروع قبل البناء")
-    p.add_argument("--check-tools", action="store_true", help="عرض حالة كل أداة")
-    p.add_argument("-v", "--verbose", action="store_true", help="مخرجات تفصيلية")
-    p.add_argument("-I", "--interactive", action="store_true", help="تشغيل المعالج التفاعلي")
-    p.add_argument("--quick", action="store_true", help="تخطي الأسئلة، استخدام الافتراضيات")
-    p.add_argument("-y", "--yes", action="store_true", help="افترض \"نعم\" على كل الأسئلة (CI)")
-    p.add_argument("--version", action="version",
-                   version=f"{TOOL_NAME} {VERSION_TAG} ({VERSION})")
-    return p
+                   help="produce a single file where the toolchain supports it")
+    p.add_argument("--noconsole", action="store_true",
+                   help="build a windowed app with no console (GUI apps)")
+    p.add_argument("--console", action="store_true",
+                   help="build a console app (default; cancels --noconsole) — "
+                        "toolbox compatibility")
+    p.add_argument("-o", "--output-dir", default=DEFAULT_OUTPUT_DIR,
+                   help=f"output directory inside the project (default: {DEFAULT_OUTPUT_DIR})")
+    p.add_argument("--output", dest="output_dir_alt", default=None, metavar="DIR",
+                   help="alias of --output-dir — toolbox compatibility")
+    p.add_argument("--target-os", choices=TARGET_OS_CHOICES, default="native",
+                   help="target operating system (default: native)")
+    p.add_argument("--target", dest="target_os_alt",
+                   choices=TARGET_OS_CHOICES + ("host",), default=None,
+                   help="alias of --target-os (host = native) — toolbox compatibility")
+    p.add_argument("--engine", choices=("pyinstaller", "nuitka"),
+                   default="pyinstaller", help="Python build engine")
+    p.add_argument("--backend", default=None, metavar="NAME",
+                   help="backend hint (toolbox compatibility): auto, pyinstaller, "
+                        "nuitka, cx_freeze, jpackage, gradle, maven, pkg, nexe, "
+                        "electron-builder, gcc, clang, g++, clang++, cmake, "
+                        "dotnet, go, cargo, flutter, dart, ocra, box",)
+    p.add_argument("--auto-install", action="store_true",
+                   help="install missing build tools automatically (never asks)")
+    p.add_argument("--clean", action="store_true",
+                   help="delete the output directory before building")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="show full output of build commands")
+    p.add_argument("--check-tools", action="store_true",
+                   help="show the status of all known tools and exit")
+    p.add_argument("--list-langs", action="store_true",
+                   help="list supported languages and exit")
+    p.add_argument("--update", action="store_true",
+                   help="self-update (requires POLYBUILD_* env vars; never asks)")
+    p.add_argument("--version", action="version", version=f"{TOOL_NAME} {VERSION}")
+    return p.parse_args(argv)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 15) main()
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _print_detection(det: DetectedProject, verbose: bool) -> None:
-    rows: List[Any] = [("اللغة", det.label), ("الثقة", f"{det.confidence * 100:.0f}%")]
-    if det.entry_point:
-        rows.append(("نقطة الدخول", det.entry_point))
-    if det.project_name:
-        rows.append(("الاسم", det.project_name))
-    if verbose:
-        for e in det.evidence:
-            rows.append(e)
-    render_box("نتيجة الكشف التلقائي", rows, width=62)
-
-
-def _fail_unknown() -> int:
-    err("لم أتمكن من تحديد لغة المشروع.")
-    langs = "، ".join(l.value for l in LANG_ORDER)
-    hint(f"حدّد اللغة يدويًا بـ --lang. اللغات المدعومة:\n  {langs}")
-    return 1
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    _force_utf8_stdio()
-    parser = build_arg_parser()
-    opts = parser.parse_args(argv)
-    opts.update_deps = bool(getattr(opts, "update_deps", False))
-
-    installer = BaseToolInstaller()
-    deps = DependencyManager(installer, assume_yes=opts.yes, quick=opts.quick,
-                             verbose=opts.verbose)
-
-    # إجراءات إدارية لا تحتاج مشروعًا
-    if opts.check_tools:
-        print_banner()
-        return deps.check_all()
-    if opts.update:
-        print_banner()
-        try:
-            return SelfUpdater(assume_yes=opts.yes).run()
-        except BuildError as e:
-            err("فشل التحديث:\n" + str(e))
-            return 1
+def _run_build_command(args: argparse.Namespace) -> int:
+    # [toolbox compat] positional PROJECT (what the toolbox passes) wins over
+    # -p/--project; it may be a directory OR a single source file.
+    project_raw = getattr(args, "project_pos", None) or args.project
+    project = Path(project_raw).expanduser().resolve()
+    if not project.exists():
+        raise BuildError(f"Project path not found: {project}")
 
     print_banner()
+    SelfUpdater().check_at_startup()
 
-    # فحص تحديث غير معيق عند الإقلاع (إن ضُبط رابط الإصدار)
-    if not opts.quick:
+    installer = BaseToolInstaller()
+    deps = DependencyManager(installer, auto_install=args.auto_install,
+                             verbose=args.verbose)
+
+    # ---- [new] -s/--src: build one specific file ----
+    src_file: Optional[Path] = None
+    if args.src and getattr(args, "project_pos", None):
+        raise BuildError("Use either the positional PROJECT or -s/--src, not both.")
+    if args.src:
+        if args.entry:
+            raise BuildError("Use either -s/--src or -e/--entry, not both.")
+        cand = Path(args.src).expanduser()
+        cand = cand if cand.is_absolute() else (Path.cwd() / cand)
+        cand = cand.resolve()
+        if not cand.is_file():
+            raise BuildError(f"--src file not found: {args.src}")
+        if project_raw == ".":
+            # no explicit -p: the file's folder becomes the project root
+            project = cand.parent
         try:
-            SelfUpdater(assume_yes=True).check_at_startup()
-        except Exception:
-            pass  # فشل الفحص لا يعطل الأداة أبدًا
-
-    # المعالج التفاعلي: تلقائيًا بلا --project وعلى TTY، أو مع -I
-    if opts.interactive or (not opts.project and sys.stdin.isatty() and not opts.quick):
-        try:
-            InteractiveUI(opts).run()
-        except UserCancel:
-            warn("أُلغي بواسطة المستخدم.")
-            return 130
-    if not opts.project:
-        err("مطلوب مجلد المشروع: استخدم --project أو شغّل المعالج التفاعلي من طرفية.")
-        hint("مثال: python polybuild.py -p ./myapp")
-        return 2
-
-    project = Path(opts.project).expanduser()
-    if not project.is_dir():
-        err(f"مجلد المشروع غير موجود: {project}")
-        return 2
-    opts.project = str(project.resolve())
-
-    # تحديد اللغة
-    if opts.lang:
-        try:
-            lang = LangType(opts.lang.strip().lower())
+            cand.relative_to(project)
         except ValueError:
-            err(f"لغة غير معروفة: {opts.lang}")
-            hint("اللغات: " + "، ".join(l.value for l in LANG_ORDER))
-            return 2
-        det = ProjectDetector(project).detect()
-        if opts.verbose:
-            _print_detection(det, True)
-        info(f"اللغة مفروضة يدويًا: {LANG_LABELS.get(lang, lang.value)}")
+            raise BuildError(f"--src file must live inside the project directory "
+                             f"({project}) — or drop -p and let -s pick its folder.")
+        src_file = cand
+    elif project.is_file():
+        # [toolbox compat] the toolbox may pass a single source file as the
+        # positional PROJECT — treat it exactly like -s/--src.
+        if args.entry:
+            raise BuildError("Pass either a single source file or --entry, not both.")
+        src_file = project
+        project = project.parent
+
+    # ---- language detection (or forced via --lang, or inferred from --src) ----
+    detector = ProjectDetector(project)
+    det = detector.detect()
+    if args.lang:
+        # [toolbox compat] aliases (javascript/typescript/csharp/php) map to
+        # canonical LangTypes; javascript/typescript honor Electron projects.
+        forced = normalize_lang_choice(args.lang, detector)
+        det.lang = forced
+        det.confidence = 1.0
+        det.evidence = [f"forced via --lang {args.lang}"]
+        det.entry_point = detector.detect_entry(forced)
+    elif src_file is not None:
+        inferred = SRC_EXT_LANG.get(src_file.suffix.lower(), LangType.UNKNOWN)
+        if inferred is not LangType.UNKNOWN:
+            det.lang, det.confidence = inferred, 1.0
+            det.evidence = [f"inferred from --src extension ({src_file.suffix})"]
+        # otherwise keep the project detection result as a fallback
+    if det.lang is LangType.UNKNOWN:
+        top = "; ".join(det.evidence[:3]) or "no recognizable project files"
+        raise BuildError(
+            f"Could not determine the project language ({top}).\n"
+            "Force it explicitly, e.g.:  --lang python    (see --list-langs)")
+
+    # ---- entry point: -s > --entry > detection ----
+    entry: Optional[str] = None
+    if src_file is not None:
+        entry = src_file.relative_to(project).as_posix()
+    elif args.entry:
+        ep = Path(args.entry)
+        if not (project / ep).is_file():
+            raise BuildError(f"--entry file not found: {args.entry}")
+        entry = ep.as_posix()
     else:
-        info("فحص المشروع …")
-        det = ProjectDetector(project).detect()
-        _print_detection(det, opts.verbose)
-        lang = det.lang
-        if lang is LangType.UNKNOWN:
-            return _fail_unknown()
-    if opts.verbose and det.entry_point and not opts.script:
-        info(f"نقطة دخول مقترحة: {det.entry_point}")
+        entry = det.entry_point
+        if entry is None and det.lang in ENTRY_REQUIRED_LANGS:
+            raise BuildError(
+                f"Could not auto-detect an entry point for {det.label}.\n"
+                "Pass one explicitly:  --entry <relative/path/to/file>")
 
-    # البناء
-    builder_cls = BUILDERS.get(lang)
-    if builder_cls is None:
-        err(f"لا يوجد بنّاء للغة: {lang.value}")
-        return 1
-    builder = builder_cls(opts, deps)
-    start = time.monotonic()
-    try:
-        artifact = builder.build()
-    except GuidanceBuild as g:
-        render_box(g.title, g.steps, width=66)
-        hint("أداة PolyBuild لا تنتج ملفًا هنا — الإرشاد أعلاه هو المسار الرسمي.")
-        return 0
-    except BuildError as e:
-        err("فشل البناء:\n" + str(e))
-        return 1
-    except UserCancel:
-        warn("أُلغي بواسطة المستخدم.")
-        return 130
-    except KeyboardInterrupt:
-        warn("أُلغي بواسطة المستخدم.")
-        return 130
-    except NotImplementedError:
-        err("هذا البنّاء غير مكتمل لهذه اللغة.")
-        return 1
+    # ---- output name / directory ----
+    name = sanitize_name(args.name or det.project_name or project.name)
+    # [toolbox compat] --output is an alias of --output-dir
+    out_name = getattr(args, "output_dir_alt", None) or args.output_dir
+    out_dir = (project / out_name).resolve()
+    if out_dir == project:
+        # [fix] safety guard: never use the project root as the output folder
+        raise BuildError("Refusing to use the project root as the output directory.")
+    if args.clean and out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
 
-    summary_panel(artifact, time.monotonic() - start,
-                  LANG_LABELS.get(lang, lang.value), builder.TITLE)
+    # ---- [new] --icon: verify the file exists (project dir first, then cwd) ----
+    icon: Optional[Path] = None
+    if args.icon:
+        c = Path(args.icon).expanduser()
+        for base in (project, Path.cwd()):
+            cand = c if c.is_absolute() else (base / c)
+            if cand.is_file():
+                icon = cand.resolve()
+                break
+        if icon is None:
+            raise BuildError(f"--icon file not found: {args.icon}")
+
+    # ---- [new] --add-data: resolve every spec ----
+    add_data: List[Tuple[Path, str]] = []
+    if args.add_data:
+        add_data = resolve_data_specs(args.add_data, project)
+
+    # ---- [toolbox compat] --backend normalization + validation ----
+    backend = (getattr(args, "backend", None) or "auto").strip().lower()
+    if backend not in KNOWN_BACKENDS:
+        raise BuildError(f"Unknown --backend '{args.backend}'. Known backends:\n"
+                         "  " + ", ".join(sorted(KNOWN_BACKENDS - {"-"})))
+
+    # [toolbox compat] --console cancels --noconsole; --target is an alias of
+    # --target-os ("host" = native)
+    noconsole = args.noconsole and not args.console
+    target_arg = (args.target_os if args.target_os != "native"
+                  else (getattr(args, "target_os_alt", None) or "native"))
+
+    cfg = BuildConfig(project=project, name=name, onefile=args.onefile,
+                      noconsole=noconsole,
+                      target_os=resolve_target_os(target_arg),
+                      entry=entry, output_dir=out_dir,
+                      verbose=args.verbose, engine=args.engine,
+                      icon=icon, add_data=add_data,
+                      backend=backend,
+                      hidden_imports=[h for h in (args.hidden_imports or []) if h.strip()])
+
+    opts = " ".join(filter(None, [
+        "onefile" if cfg.onefile else "",
+        "noconsole" if cfg.noconsole else "",
+        "auto-install" if args.auto_install else "",
+        f"backend={cfg.backend}" if cfg.backend not in ("", "auto") else "",
+        f"hidden×{len(cfg.hidden_imports)}" if cfg.hidden_imports else "",
+    ])) or "default"
+
+    render_box(
+        f"Project: {name}",
+        [("Language", f"{det.label}  (confidence {det.confidence:.0%})"),
+         ("Evidence", "; ".join(det.evidence[:2]) or "-"),
+         ("Entry point", entry or "(decided by the build system)"),
+         ("Target OS", cfg.target_os + ("  [cross-compile]" if cfg.crossing else "")),
+         ("Output dir", str(out_dir)),
+         ("Options", opts),
+         ("Icon", str(cfg.icon) if cfg.icon else "-"),
+         ("Bundle data", f"{len(cfg.add_data)} item(s)" if cfg.add_data else "-")],
+        width=68,
+    )
+
+    factory = BUILDER_REGISTRY.get(det.lang)
+    if factory is None:
+        raise BuildError(f"No builder is registered for {det.label}.")
+    builder = factory(cfg, deps)
+
+    t0 = time.time()
+    info(f"Building with {builder.TOOL_LABEL} ...")
+    artifacts = builder.build()
+    elapsed = time.time() - t0
+
+    summary_panel(artifacts[0], elapsed, det.label, builder.TOOL_LABEL,
+                  extra=[("Artifacts", str(len(artifacts)))]
+                        + [("Also", str(a)) for a in artifacts[1:4]])
+    ok(f"Done in {elapsed:.1f}s — {len(artifacts)} artifact(s) in {out_dir}")
     return 0
 
 
-if __name__ == "__main__":
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
     try:
-        sys.exit(main())
+        if args.check_tools:
+            installer = BaseToolInstaller()
+            if not installer.available():
+                warn("No system package manager detected; "
+                     "language managers (pip/gem/cpan) may still work.")
+            return DependencyManager(installer).check_all()
+        if args.list_langs:
+            rows = [(l.value, LANG_LABELS[l]) for l in LangType
+                    if l is not LangType.UNKNOWN]
+            render_box("Supported languages", rows, width=58)
+            return 0
+        if args.update:
+            SelfUpdater().run()
+            return 0
+        return _run_build_command(args)
+    except GuidanceBuild as g:
+        err(g.title)
+        print()
+        for i, step in enumerate(g.steps, 1):
+            print(f"  {i}. {step}")
+        print()
+        hint("This project type has no CLI build path — follow the steps above.")
+        return 2
+    except BuildError as e:
+        err(str(e))
+        return 1
     except KeyboardInterrupt:
-        _force_utf8_stdio()
-        warn("أُلغي بواسطة المستخدم.")
-        sys.exit(130)
+        err("Interrupted by user.")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
